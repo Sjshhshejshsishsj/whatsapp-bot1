@@ -37,7 +37,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-AI_MODEL = "gemini-1.5-flash-latest"
+AI_MODEL = "gemini-pro"
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
