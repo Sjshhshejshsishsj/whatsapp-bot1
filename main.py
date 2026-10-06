@@ -42,7 +42,6 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 
 
 # ---------- Google Sheets Setup (Updated & Fixed) ----------
-# ---------- Google Sheets Setup (Updated & Fixed) ----------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -480,3 +479,10 @@ def send_product_list(recipient_phone):
         logging.info(f"Product list sent to {recipient_phone}")
     except Exception as e:
         logging.error(f"Error sending product list: {e}")
+
+
+# ---------- Railway Server Run ----------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
