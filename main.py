@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import logging
 import os
 import sqlite3
 from contextlib import closing
@@ -8,8 +9,17 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 import requests
+import gspread
+from google.oauth2.service_account import Credentials
 
 load_dotenv()
+
+# ---------- Logging Setup (Phase 1) ----------
+logging.basicConfig(
+    filename="bot.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 app = FastAPI()
 
@@ -20,10 +30,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 AI_MODEL = "gemini-3.1-flash-lite"
 SYSTEM_PROMPT = (
-    "Tum ek dostana WhatsApp assistant ho. User jis zubaan mein likhe "
-    "(Roman Urdu, Urdu ya English), usi mein jawab do. Jawab chhota rakho "
-    "(2-4 jumle), saada text mein, heading ya markdown ke baghair. "
-    "Agar kisi baat ka pata na ho toh sach bol do."
+    "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
+    "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
+    "Jawab chhota rakho (2-4 jumle), saada text mein, heading ya markdown ke baghair. "
+    "User ko products dekhne, catalog open karne aur orders place karne mein madad karo."
 )
 FIXED_COMMANDS = ["help", "status", "about"]
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -31,20 +41,60 @@ MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 
 
+# ---------- Google Sheets Setup (Updated & Fixed) ----------
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+CREDS_FILE = "credentials.json"
+SHEET_NAME = "Apex Orders"
+
+sheet = None
+try:
+    if os.path.exists(CREDS_FILE):
+        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+        client = gspread.authorize(creds)
+        sheet = client.open(SHEET_NAME).sheet1
+        logging.info("Google Sheets connected successfully!")
+        print("Google Sheets connected successfully!")
+    else:
+        logging.error(f"Credentials file '{CREDS_FILE}' not found.")
+        print(f"Google Sheets error: '{CREDS_FILE}' not found.")
+except Exception as e:
+    logging.error(f"Google Sheets connection error: {e}")
+    print(f"Google Sheets connection error: {e}")
+
+
+def log_order_to_sheet(user_phone, order_details):
+    try:
+        if sheet:
+            sheet.append_row([user_phone, order_details, datetime.now(timezone.utc).isoformat()])
+            logging.info(f"Order logged to sheet for {user_phone}")
+        else:
+            logging.warning("Sheet object not initialized, skipping sheet log.")
+    except Exception as e:
+        logging.error(f"Error saving to sheet: {e}")
+        print(f"Error saving to sheet: {e}")
+
+
 # ---------- Database ----------
 def init_db():
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                wa_id TEXT UNIQUE,
-                phone TEXT NOT NULL,
-                direction TEXT NOT NULL,
-                text TEXT,
-                created_at TEXT NOT NULL
-            )"""
-        )
-        conn.commit()
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wa_id TEXT UNIQUE,
+                    phone TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    text TEXT,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            conn.commit()
+        logging.info("Database initialized successfully.")
+    except Exception as e:
+        logging.error(f"Database initialization error: {e}")
 
 
 def save_message(phone, direction, text, wa_id=None):
@@ -60,32 +110,37 @@ def save_message(phone, direction, text, wa_id=None):
             conn.commit()
             return cur.rowcount == 1
     except Exception as e:
+        logging.error(f"DB error in save_message: {e}")
         print(f"DB error: {e}")
         return True
 
 
 def get_history(phone, limit=10):
     """Is user ke last messages, Gemini ke format mein."""
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        rows = conn.execute(
-            "SELECT direction, text FROM messages WHERE phone=? "
-            "ORDER BY id DESC LIMIT ?",
-            (phone, limit),
-        ).fetchall()
-    rows.reverse()
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT direction, text FROM messages WHERE phone=? "
+                "ORDER BY id DESC LIMIT ?",
+                (phone, limit),
+            ).fetchall()
+        rows.reverse()
 
-    history = []
-    for direction, text in rows:
-        if not text or text.startswith("["):
-            continue
-        role = "user" if direction == "in" else "model"
-        if history and history[-1]["role"] == role:
-            history[-1]["parts"][0]["text"] += "\n" + text
-        else:
-            history.append({"role": role, "parts": [{"text": text}]})
-    while history and history[0]["role"] != "user":
-        history.pop(0)
-    return history
+        history = []
+        for direction, text in rows:
+            if not text or text.startswith("["):
+                continue
+            role = "user" if direction == "in" else "model"
+            if history and history[-1]["role"] == role:
+                history[-1]["parts"][0]["text"] += "\n" + text
+            else:
+                history.append({"role": role, "parts": [{"text": text}]})
+        while history and history[0]["role"] != "user":
+            history.pop(0)
+        return history
+    except Exception as e:
+        logging.error(f"Error fetching history for {phone}: {e}")
+        return []
 
 
 init_db()
@@ -103,25 +158,25 @@ def download_media(media_id):
         ).json()
         url = meta.get("url")
         if not url:
-            print(f"Media error: {meta}")
+            logging.warning(f"Media URL not found in meta: {meta}")
             return None, None
         r = requests.get(url, headers=headers, timeout=60)
         if r.status_code != 200:
-            print(f"Media download error: {r.status_code}")
+            logging.error(f"Media download failed with status: {r.status_code}")
             return None, None
         if len(r.content) > MAX_MEDIA_BYTES:
-            print("Media bohat badi hai, skip.")
+            logging.warning("Media size exceeds maximum limit.")
             return None, None
         return r.content, meta.get("mime_type")
     except Exception as e:
-        print(f"Media error: {e}")
+        logging.error(f"Media download exception: {e}")
         return None, None
 
 
 # ---------- AI (Gemini) ----------
 def ask_ai(phone, media_id=None, caption=""):
     if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY set nahi hai")
+        logging.error("GEMINI_API_KEY is not set.")
         return None
 
     contents = get_history(phone)
@@ -165,13 +220,13 @@ def ask_ai(phone, media_id=None, caption=""):
             timeout=60,
         )
         if r.status_code != 200:
-            print(f"AI error: {r.status_code} {r.text}")
+            logging.error(f"AI API error: {r.status_code} {r.text}")
             return None
         parts = r.json()["candidates"][0]["content"]["parts"]
         text = "".join(p.get("text", "") for p in parts).strip()
         return text or None
     except Exception as e:
-        print(f"AI error: {e}")
+        logging.error(f"AI exception: {e}")
         return None
 
 
@@ -184,17 +239,19 @@ async def verify_webhook(request: Request):
 
     if mode and token:
         if mode == "subscribe" and token == VERIFY_TOKEN:
+            logging.info("Webhook Verified successfully.")
             print(f"Webhook Verified! Challenge: {challenge}")
             return int(challenge)
+    logging.warning("Webhook verification failed.")
     return {"error": "Verification failed"}
 
 
 @app.post("/webhook")
 async def receive_webhook(request: Request):
-    body = await request.json()
-    print("Webhook Data:", body)
-
     try:
+        body = await request.json()
+        logging.info("Webhook received data.")
+
         for entry in body.get("entry", []):
             for change in entry.get("changes", []):
                 value = change.get("value", {})
@@ -207,11 +264,18 @@ async def receive_webhook(request: Request):
 
                 media_id = None
                 caption = ""
+                command = ""
 
                 if msg_type == "text":
                     command = message["text"]["body"].strip().lower()
                 elif msg_type == "interactive":
-                    command = message["interactive"]["button_reply"]["id"]
+                    interactive_data = message.get("interactive", {})
+                    if "button_reply" in interactive_data:
+                        command = interactive_data["button_reply"]["id"]
+                    elif "list_reply" in interactive_data:
+                        command = interactive_data["list_reply"]["id"]
+                    else:
+                        command = "unknown"
                 elif msg_type == "image":
                     media_id = message["image"]["id"]
                     caption = message["image"].get("caption", "").strip()
@@ -231,11 +295,12 @@ async def receive_webhook(request: Request):
                     continue
 
                 if not save_message(sender_phone, "in", command, message.get("id")):
-                    print("Duplicate message, skip.")
+                    logging.info("Duplicate message skipped.")
                     continue
 
-                print(f"Message aya {sender_phone} se: {command}")
+                logging.info(f"Message from {sender_phone}: {command}")
 
+                # Routing commands & actions
                 if media_id:
                     ai_text = await asyncio.to_thread(
                         ask_ai, sender_phone, media_id, caption
@@ -250,6 +315,16 @@ async def receive_webhook(request: Request):
                     send_buttons(sender_phone)
                 elif command in FIXED_COMMANDS:
                     send_whatsapp_message(sender_phone, get_reply(command))
+                elif command in ["catalog", "shop", "products", "item_1", "item_2"] or "order" in command or "kharidna" in command:
+                    if command in ["item_1", "item_2"]:
+                        order_text = f"Selected Product ID: {command}"
+                        log_order_to_sheet(sender_phone, order_text)
+                        send_whatsapp_message(
+                            sender_phone,
+                            f"Shukriya! Aapka order ({command}) record kar liya gaya hai. Hum jald rabta karenge."
+                        )
+                    else:
+                        send_product_list(sender_phone)
                 else:
                     ai_text = await asyncio.to_thread(ask_ai, sender_phone)
                     send_whatsapp_message(
@@ -260,6 +335,7 @@ async def receive_webhook(request: Request):
                     )
 
     except Exception as e:
+        logging.error(f"Error parsing webhook message: {e}")
         print(f"Error parsing message: {e}")
 
     return {"status": "ok"}
@@ -270,15 +346,19 @@ async def receive_webhook(request: Request):
 async def list_messages(key: str = ""):
     if not VERIFY_TOKEN or key != VERIFY_TOKEN:
         return {"error": "unauthorized"}
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        rows = conn.execute(
-            "SELECT phone, direction, text, created_at FROM messages "
-            "ORDER BY id DESC LIMIT 20"
-        ).fetchall()
-    return [
-        {"phone": r[0], "direction": r[1], "text": r[2], "time": r[3]}
-        for r in rows
-    ]
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            rows = conn.execute(
+                "SELECT phone, direction, text, created_at FROM messages "
+                "ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        return [
+            {"phone": r[0], "direction": r[1], "text": r[2], "time": r[3]}
+            for r in rows
+        ]
+    except Exception as e:
+        logging.error(f"Error listing messages: {e}")
+        return {"error": "Internal server error"}
 
 
 # ---------- Bot logic ----------
@@ -287,6 +367,7 @@ def get_reply(command):
         return (
             "Aap yeh commands use kar sakte hain:\n"
             "1. hi / hello / menu\n2. help\n3. status\n4. about\n"
+            "5. catalog / order (Products dekhne ke liye)\n"
             "Koi bhi sawal seedha likh dein, ya image / PDF bhej dein, "
             "AI jawab dega."
         )
@@ -299,13 +380,16 @@ def get_reply(command):
 
 # ---------- Sending ----------
 def send_payload(payload):
-    url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    response = requests.post(url, json=payload, headers=headers)
-    print("Reply Response:", response.json())
+    try:
+        url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
+        headers = {
+            "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        response = requests.post(url, json=payload, headers=headers, timeout=30)
+        logging.info(f"WhatsApp API Response: {response.json()}")
+    except Exception as e:
+        logging.error(f"Error sending WhatsApp payload: {e}")
 
 
 def send_whatsapp_message(recipient_phone, message_text):
@@ -338,3 +422,49 @@ def send_buttons(recipient_phone):
             },
         },
     })
+
+
+def send_product_list(recipient_phone):
+    try:
+        save_message(recipient_phone, "out", "[product catalog menu]")
+        send_payload({
+            "messaging_product": "whatsapp",
+            "to": recipient_phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "header": {
+                    "type": "text",
+                    "text": "🛍️ Product Catalog"
+                },
+                "body": {
+                    "text": "Neeche diye gaye button par click karke hamari items dekhein aur order select karein:"
+                },
+                "footer": {
+                    "text": "Powered by Apex Order Bot"
+                },
+                "action": {
+                    "button": "Catalog Dekhein",
+                    "sections": [
+                        {
+                            "title": "Available Items",
+                            "rows": [
+                                {
+                                    "id": "item_1",
+                                    "title": "Item 1 - Special Deal",
+                                    "description": "Best price and high quality."
+                                },
+                                {
+                                    "id": "item_2",
+                                    "title": "Item 2 - Standard Pack",
+                                    "description": "Perfect for daily use."
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        })
+        logging.info(f"Product list sent to {recipient_phone}")
+    except Exception as e:
+        logging.error(f"Error sending product list: {e}")
