@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+
 sqlite3_imported = True
 try:
     import sqlite3
@@ -37,7 +38,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-AI_MODEL = "gemini-pro"
+AI_MODEL = "gemini-1.5-flash"
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
@@ -48,7 +49,6 @@ FIXED_COMMANDS = ["help", "status", "about"]
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
-
 
 # ---------- Google Sheets Setup ----------
 SCOPES = [
@@ -74,6 +74,7 @@ try:
         logging.info("Google Sheets connected successfully!")
 except Exception as e:
     logging.error(f"Google Sheets connection error: {e}")
+
 
 def log_order_to_sheet(user_phone, order_details):
     try:
@@ -135,10 +136,10 @@ def get_history(phone, limit=6):
                 continue
             role = "user" if direction == "in" else "model"
             history.append({"role": role, "parts": [{"text": text}]})
-            
+
         while history and history[0]["role"] != "user":
             history.pop(0)
-            
+
         return history
     except Exception as e:
         logging.error(f"Error fetching history for {phone}: {e}")
@@ -198,7 +199,7 @@ def ask_ai(phone, media_id=None, caption=""):
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
-        
+
         payload = {
             "contents": contents,
             "generationConfig": {"maxOutputTokens": 1000},
@@ -211,9 +212,8 @@ def ask_ai(phone, media_id=None, caption=""):
             json=payload,
             timeout=60,
         )
-        
+
         if r.status_code != 200:
-            # Yeh line ab seedha terminal aur log dono par exact error print karegi
             error_msg = f"AI API error code {r.status_code}: {r.text}"
             logging.error(error_msg)
             return f"Maazrat, AI error ({r.status_code})."
@@ -222,7 +222,7 @@ def ask_ai(phone, media_id=None, caption=""):
         candidates = res_json.get("candidates", [])
         if not candidates:
             return "Maazrat, AI ne koi jawab nahi diya."
-            
+
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "".join(p.get("text", "") for p in parts).strip()
         return text or "Maazrat, main samajh nahi saka."
@@ -382,7 +382,8 @@ def send_product_list(recipient_phone):
             "interactive": {
                 "type": "list",
                 "header": {"type": "text", "text": "🛍️ Product Catalog"},
-                "body": {"text": "Neeche diye gaye button par click karke hamari items dekhein aur order select karein:"},
+                "body": {
+                    "text": "Neeche diye gaye button par click karke hamari items dekhein aur order select karein:"},
                 "footer": {"text": "Powered by Apex Order Bot"},
                 "action": {
                     "button": "Catalog Dekhein",
@@ -390,8 +391,10 @@ def send_product_list(recipient_phone):
                         {
                             "title": "Available Items",
                             "rows": [
-                                {"id": "item_1", "title": "Item 1 - Special Deal", "description": "Best price and high quality."},
-                                {"id": "item_2", "title": "Item 2 - Standard Pack", "description": "Perfect for daily use."}
+                                {"id": "item_1", "title": "Item 1 - Special Deal",
+                                 "description": "Best price and high quality."},
+                                {"id": "item_2", "title": "Item 2 - Standard Pack",
+                                 "description": "Perfect for daily use."}
                             ]
                         }
                     ]
