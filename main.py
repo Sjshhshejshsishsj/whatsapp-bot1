@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import sys
 sqlite3_imported = True
 try:
     import sqlite3
@@ -19,11 +20,14 @@ from google.oauth2.service_account import Credentials
 
 load_dotenv()
 
-# ---------- Logging Setup ----------
+# ---------- Logging Setup (Console + File) ----------
 logging.basicConfig(
-    filename="bot.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 
 app = FastAPI()
@@ -33,7 +37,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-AI_MODEL = "gemini-pro"
+AI_MODEL = "gemini-1.5-flash"
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
@@ -195,15 +199,11 @@ def ask_ai(phone, media_id=None, caption=""):
             f"{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         )
         
-        # System instructions ko properly contents ke sath combine karna taake 404/bad request na aaye
         payload = {
             "contents": contents,
-            "generationConfig": {"maxOutputTokens": 1000}
+            "generationConfig": {"maxOutputTokens": 1000},
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]}
         }
-        
-        # Agar system prompt dena ho toh usay pehlay user prompt ya instructions ki tarah pass kar sakte hain, 
-        # yahan hum system prompt ko first role instruction ke tor par ya safe payload mein bhej rahe hain:
-        payload["system_instruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
 
         r = requests.post(
             url,
@@ -213,8 +213,10 @@ def ask_ai(phone, media_id=None, caption=""):
         )
         
         if r.status_code != 200:
-            logging.error(f"AI API error code {r.status_code}: {r.text}")
-            return "Maazrat, abhi main jawab nahi de saka. Thori der baad try karein."
+            # Yeh line ab seedha terminal aur log dono par exact error print karegi
+            error_msg = f"AI API error code {r.status_code}: {r.text}"
+            logging.error(error_msg)
+            return f"Maazrat, AI error ({r.status_code})."
 
         res_json = r.json()
         candidates = res_json.get("candidates", [])
@@ -299,11 +301,9 @@ async def receive_webhook(request: Request):
                         sender_phone,
                         f"Shukriya! Aapka order ({command}) record kar liya gaya hai. Hum jald rabta karenge."
                     )
-                # Agar user ke message mein "order", "kharidna", "catalog", "products", ya "shop" aaye to product list bhejo
                 elif any(word in command for word in ["order", "kharidna", "catalog", "products", "shop"]):
                     send_product_list(sender_phone)
                 else:
-                    # Baqi sab sawalat seedha Gemini AI ke paas jayenge
                     ai_text = await asyncio.to_thread(ask_ai, sender_phone)
                     send_whatsapp_message(sender_phone, ai_text)
 
