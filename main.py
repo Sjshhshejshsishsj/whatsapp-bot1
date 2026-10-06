@@ -1,11 +1,16 @@
 import asyncio
 import base64
+import json
 import logging
 import os
-import sqlite3
-from contextlib import closing
-from datetime import datetime, timezone
+sqlite3_imported = True
+try:
+    import sqlite3
+    from contextlib import closing
+except ImportError:
+    sqlite3_imported = False
 
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 import requests
@@ -28,7 +33,8 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-AI_MODEL = "gemini-3.1-flash-lite"
+# Updated to a stable, supported Gemini model version
+AI_MODEL = "gemini-1.5-flash"
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
@@ -41,7 +47,7 @@ MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 
 
-# ---------- Google Sheets Setup (Updated & Fixed) ----------
+# ---------- Google Sheets Setup ----------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -51,9 +57,6 @@ SHEET_NAME = "Apex Orders"
 
 sheet = None
 try:
-    import json
-    from google.oauth2 import service_account
-
     creds = None
     # 1. Pehle check karein agar Railway ke environment variable mein JSON string parhi hai
     google_creds_env = os.getenv("GOOGLE_CREDENTIALS_JSON")
