@@ -1,4 +1,7 @@
 fastapi
 uvicorn
+gspread
 requests
+google-generativeai
+oauth2client
 python-dotenv
