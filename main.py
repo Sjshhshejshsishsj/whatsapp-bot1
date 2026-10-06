@@ -3,7 +3,6 @@ import base64
 import json
 import logging
 import os
-
 sqlite3_imported = True
 try:
     import sqlite3
@@ -34,7 +33,6 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Stable Gemini model
 AI_MODEL = "gemini-1.5-flash"
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
@@ -46,6 +44,7 @@ FIXED_COMMANDS = ["help", "status", "about"]
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+
 
 # ---------- Google Sheets Setup ----------
 SCOPES = [
@@ -72,7 +71,6 @@ try:
 except Exception as e:
     logging.error(f"Google Sheets connection error: {e}")
 
-
 def log_order_to_sheet(user_phone, order_details):
     try:
         if sheet:
@@ -87,31 +85,14 @@ def init_db():
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
             conn.execute(
-                """CREATE TABLE IF NOT EXISTS messages
-                   (
-                       id
-                       INTEGER
-                       PRIMARY
-                       KEY
-                       AUTOINCREMENT,
-                       wa_id
-                       TEXT
-                       UNIQUE,
-                       phone
-                       TEXT
-                       NOT
-                       NULL,
-                       direction
-                       TEXT
-                       NOT
-                       NULL,
-                       text
-                       TEXT,
-                       created_at
-                       TEXT
-                       NOT
-                       NULL
-                   )"""
+                """CREATE TABLE IF NOT EXISTS messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    wa_id TEXT UNIQUE,
+                    phone TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    text TEXT,
+                    created_at TEXT NOT NULL
+                )"""
             )
             conn.commit()
     except Exception as e:
@@ -134,7 +115,7 @@ def save_message(phone, direction, text, wa_id=None):
         return True
 
 
-def get_history(phone, limit=10):
+def get_history(phone, limit=6):
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
             rows = conn.execute(
@@ -149,12 +130,11 @@ def get_history(phone, limit=10):
             if not text or text.startswith("["):
                 continue
             role = "user" if direction == "in" else "model"
-            if history and history[-1]["role"] == role:
-                history[-1]["parts"][0]["text"] += "\n" + text
-            else:
-                history.append({"role": role, "parts": [{"text": text}]})
+            history.append({"role": role, "parts": [{"text": text}]})
+            
         while history and history[0]["role"] != "user":
             history.pop(0)
+            
         return history
     except Exception as e:
         logging.error(f"Error fetching history for {phone}: {e}")
@@ -198,44 +178,49 @@ def ask_ai(phone, media_id=None, caption=""):
         if not data or not mime:
             return "Maazrat, file download nahi ho saki."
         prompt = caption or "Is file mein kya hai? Mukhtasar bayan karo."
-        parts = [
-            {"inline_data": {
-                "mime_type": mime,
-                "data": base64.b64encode(data).decode(),
-            }},
-            {"text": prompt},
-        ]
-        if contents and contents[-1]["role"] == "user":
-            contents[-1]["parts"] = parts
-        else:
-            contents.append({"role": "user", "parts": parts})
+        contents.append({
+            "role": "user",
+            "parts": [
+                {"inline_data": {"mime_type": mime, "data": base64.b64encode(data).decode()}},
+                {"text": prompt}
+            ]
+        })
 
     if not contents or contents[-1]["role"] != "user":
         contents.append({"role": "user", "parts": [{"text": "Hello"}]})
 
     try:
-        url = f"https://generativelanguage.googleapis.com/v1/models/{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+        )
+        
+        # System instructions ko properly contents ke sath combine karna taake 404/bad request na aaye
+        payload = {
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 1000}
+        }
+        
+        # Agar system prompt dena ho toh usay pehlay user prompt ya instructions ki tarah pass kar sakte hain, 
+        # yahan hum system prompt ko first role instruction ke tor par ya safe payload mein bhej rahe hain:
+        payload["system_instruction"] = {"parts": [{"text": SYSTEM_PROMPT}]}
+
         r = requests.post(
             url,
             headers={"Content-Type": "application/json"},
-            json={
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                "contents": contents,
-                "generationConfig": {"maxOutputTokens": 1000},
-            },
+            json=payload,
             timeout=60,
         )
-
-        # Agar error aaye to log print kar dein taake pata chalay
+        
         if r.status_code != 200:
             logging.error(f"AI API error code {r.status_code}: {r.text}")
-            return f"Maazrat, AI server connection error ({r.status_code})."
+            return "Maazrat, abhi main jawab nahi de saka. Thori der baad try karein."
 
         res_json = r.json()
         candidates = res_json.get("candidates", [])
         if not candidates:
             return "Maazrat, AI ne koi jawab nahi diya."
-
+            
         parts = candidates[0].get("content", {}).get("parts", [])
         text = "".join(p.get("text", "") for p in parts).strip()
         return text or "Maazrat, main samajh nahi saka."
@@ -397,8 +382,7 @@ def send_product_list(recipient_phone):
             "interactive": {
                 "type": "list",
                 "header": {"type": "text", "text": "🛍️ Product Catalog"},
-                "body": {
-                    "text": "Neeche diye gaye button par click karke hamari items dekhein aur order select karein:"},
+                "body": {"text": "Neeche diye gaye button par click karke hamari items dekhein aur order select karein:"},
                 "footer": {"text": "Powered by Apex Order Bot"},
                 "action": {
                     "button": "Catalog Dekhein",
@@ -406,10 +390,8 @@ def send_product_list(recipient_phone):
                         {
                             "title": "Available Items",
                             "rows": [
-                                {"id": "item_1", "title": "Item 1 - Special Deal",
-                                 "description": "Best price and high quality."},
-                                {"id": "item_2", "title": "Item 2 - Standard Pack",
-                                 "description": "Perfect for daily use."}
+                                {"id": "item_1", "title": "Item 1 - Special Deal", "description": "Best price and high quality."},
+                                {"id": "item_2", "title": "Item 2 - Standard Pack", "description": "Perfect for daily use."}
                             ]
                         }
                     ]
@@ -422,6 +404,5 @@ def send_product_list(recipient_phone):
 
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
