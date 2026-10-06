@@ -42,6 +42,7 @@ DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
 
 
 # ---------- Google Sheets Setup (Updated & Fixed) ----------
+# ---------- Google Sheets Setup (Updated & Fixed) ----------
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
@@ -51,19 +52,30 @@ SHEET_NAME = "Apex Orders"
 
 sheet = None
 try:
-    if os.path.exists(CREDS_FILE):
+    import json
+    from google.oauth2 import service_account
+
+    creds = None
+    # 1. Pehle check karein agar Railway ke environment variable mein JSON string parhi hai
+    google_creds_env = os.getenv("GOOGLE_CREDENTIALS_JSON")
+    if google_creds_env:
+        creds_dict = json.loads(google_creds_env)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    # 2. Agar file local mojood hai
+    elif os.path.exists(CREDS_FILE):
         creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+
+    if creds:
         client = gspread.authorize(creds)
         sheet = client.open(SHEET_NAME).sheet1
         logging.info("Google Sheets connected successfully!")
         print("Google Sheets connected successfully!")
     else:
-        logging.error(f"Credentials file '{CREDS_FILE}' not found.")
-        print(f"Google Sheets error: '{CREDS_FILE}' not found.")
+        logging.error("Google credentials not found in environment variables or file.")
+        print("Google Sheets error: Credentials not found.")
 except Exception as e:
     logging.error(f"Google Sheets connection error: {e}")
     print(f"Google Sheets connection error: {e}")
-
 
 def log_order_to_sheet(user_phone, order_details):
     try:
