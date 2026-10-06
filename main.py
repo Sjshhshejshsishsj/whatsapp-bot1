@@ -314,7 +314,7 @@ async def receive_webhook(request: Request):
 
                 logging.info(f"Message from {sender_phone}: {command}")
 
-                # Routing commands & actions
+                # Routing commands & actions (Fixed exact match check)
                 if media_id:
                     ai_text = await asyncio.to_thread(
                         ask_ai, sender_phone, media_id, caption
@@ -329,7 +329,7 @@ async def receive_webhook(request: Request):
                     send_buttons(sender_phone)
                 elif command in FIXED_COMMANDS:
                     send_whatsapp_message(sender_phone, get_reply(command))
-                elif command in ["catalog", "shop", "products", "item_1", "item_2"] or "order" in command or "kharidna" in command:
+                elif command in ["catalog", "shop", "products", "order", "kharidna", "item_1", "item_2"]:
                     if command in ["item_1", "item_2"]:
                         order_text = f"Selected Product ID: {command}"
                         log_order_to_sheet(sender_phone, order_text)
