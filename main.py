@@ -19,6 +19,8 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
+from gemini_client import generate
+
 load_dotenv()
 
 # ---------- Logging Setup (Console + File) ----------
@@ -38,7 +40,6 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-AI_MODEL = "gemini-1.5-flash"
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
@@ -171,6 +172,17 @@ def download_media(media_id):
 
 
 # ---------- AI (Gemini) ----------
+def merge_turns(contents):
+    """Ek ke baad ek same role wale messages ko jod deta hai."""
+    merged = []
+    for turn in contents:
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["parts"].extend(turn["parts"])
+        else:
+            merged.append({"role": turn["role"], "parts": list(turn["parts"])})
+    return merged
+
+
 def ask_ai(phone, media_id=None, caption=""):
     if not GEMINI_API_KEY:
         logging.error("GEMINI_API_KEY is not set.")
@@ -194,41 +206,13 @@ def ask_ai(phone, media_id=None, caption=""):
     if not contents or contents[-1]["role"] != "user":
         contents.append({"role": "user", "parts": [{"text": "Hello"}]})
 
-    try:
-        url = (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{AI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        )
+    contents = merge_turns(contents)
 
-        payload = {
-            "contents": contents,
-            "generationConfig": {"maxOutputTokens": 1000},
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]}
-        }
-
-        r = requests.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=60,
-        )
-
-        if r.status_code != 200:
-            error_msg = f"AI API error code {r.status_code}: {r.text}"
-            logging.error(error_msg)
-            return f"Maazrat, AI error ({r.status_code})."
-
-        res_json = r.json()
-        candidates = res_json.get("candidates", [])
-        if not candidates:
-            return "Maazrat, AI ne koi jawab nahi diya."
-
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = "".join(p.get("text", "") for p in parts).strip()
-        return text or "Maazrat, main samajh nahi saka."
-    except Exception as e:
-        logging.error(f"AI exception: {e}")
-        return "Maazrat, AI process karte waqt masla aa gaya."
+    text, err = generate(contents, SYSTEM_PROMPT, 1000)
+    if err:
+        logging.error(f"AI error: {err}")
+        return "Maazrat, abhi AI jawab nahi de saka. Thori der baad try karein."
+    return text
 
 
 # ---------- Webhook ----------
@@ -337,7 +321,9 @@ def send_payload(payload):
             "Authorization": f"Bearer {WHATSAPP_TOKEN}",
             "Content-Type": "application/json",
         }
-        requests.post(url, json=payload, headers=headers, timeout=30)
+        r = requests.post(url, json=payload, headers=headers, timeout=30)
+        if r.status_code != 200:
+            logging.error(f"WhatsApp send error {r.status_code}: {r.text}")
     except Exception as e:
         logging.error(f"Error sending WhatsApp payload: {e}")
 
