@@ -49,12 +49,10 @@ CURRENCY = "Rs"
 BRANDS = {
     "gul_ahmed": {
         "title": "Gul Ahmed",
-        "desc": "Lawn aur ready to wear",
+        "desc": "Lawn collection",
         "items": {
-            "ga_1": {"title": "Item 1 (asli naam)", "price": 1500,
-                     "desc": "Yahan asli tafseel likhein"},
-            "ga_2": {"title": "Item 2 (asli naam)", "price": 2500,
-                     "desc": "Yahan asli tafseel likhein"},
+            "lawn_01": {"title": "Summer Printed Suit", "price": 3500, "desc": "3-piece unstitched lawn"},
+            "lawn_02": {"title": "Chiffon Dupatta Suit", "price": 5500, "desc": "Fancy embroidered suit"},
         },
     },
     "lucky_garments": {
