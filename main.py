@@ -43,7 +43,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_PHONE = os.getenv("OWNER_PHONE")  # maslan 923001234567 (+ ke baghair)
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", WHATSAPP_TOKEN)  # Instagram aur Messenger ke liye
 
-# ---------- Brands aur Items (yahan apni asli cheezein likhein) ----------
+# ---------- Brands aur Items ----------
 CURRENCY = "Rs"
 BRANDS = {
     "gul_ahmed": {
@@ -173,7 +173,7 @@ def save_message(phone, direction, text, wa_id=None):
             cur = conn.execute(
                 "INSERT OR IGNORE INTO messages "
                 "(wa_id, phone, direction, text, created_at) VALUES (?,?,?,?,?)",
-                (wa_id, phone, direction, text,
+                (wa_id, str(phone), direction, text,
                  datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
@@ -189,7 +189,7 @@ def get_history(phone, limit=6):
             rows = conn.execute(
                 "SELECT direction, text FROM messages WHERE phone=? "
                 "ORDER BY id DESC LIMIT ?",
-                (phone, limit),
+                (str(phone), limit),
             ).fetchall()
         rows.reverse()
 
@@ -212,11 +212,12 @@ def get_history(phone, limit=6):
 # ---------- Order sessions ----------
 def get_session(phone):
     try:
+        phone_str = str(phone)
         with closing(sqlite3.connect(DB_PATH)) as conn:
             row = conn.execute(
                 "SELECT product_id, step, qty, name, address, updated_at "
                 "FROM order_sessions WHERE phone=?",
-                (phone,),
+                (phone_str,),
             ).fetchone()
         if not row:
             return None
@@ -224,10 +225,10 @@ def get_session(phone):
             ["product_id", "step", "qty", "name", "address", "updated_at"], row))
         age = datetime.now(timezone.utc) - datetime.fromisoformat(s["updated_at"])
         if age.total_seconds() > SESSION_TIMEOUT_MIN * 60:
-            clear_session(phone)
+            clear_session(phone_str)
             return None
         if s["product_id"] not in PRODUCTS:
-            clear_session(phone)
+            clear_session(phone_str)
             return None
         return s
     except Exception as e:
@@ -242,7 +243,7 @@ def save_session(phone, product_id, step, qty=None, name=None, address=None):
                 "INSERT OR REPLACE INTO order_sessions "
                 "(phone, product_id, step, qty, name, address, updated_at) "
                 "VALUES (?,?,?,?,?,?,?)",
-                (phone, product_id, step, qty, name, address,
+                (str(phone), product_id, step, qty, name, address,
                  datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
@@ -253,7 +254,7 @@ def save_session(phone, product_id, step, qty=None, name=None, address=None):
 def clear_session(phone):
     try:
         with closing(sqlite3.connect(DB_PATH)) as conn:
-            conn.execute("DELETE FROM order_sessions WHERE phone=?", (phone,))
+            conn.execute("DELETE FROM order_sessions WHERE phone=?", (str(phone),))
             conn.commit()
     except Exception as e:
         logging.error(f"clear_session error: {e}")
@@ -285,7 +286,6 @@ def download_media(media_id):
 
 # ---------- AI (Gemini) ----------
 def merge_turns(contents):
-    """Ek ke baad ek same role wale messages ko jod deta hai."""
     merged = []
     for turn in contents:
         if merged and merged[-1]["role"] == turn["role"]:
@@ -408,7 +408,7 @@ def finalize_order(phone, session, platform="whatsapp"):
     pname = product_name(product)
 
     log_order_to_sheet([
-        datetime.now(timezone.utc).isoformat(), phone, session["name"],
+        datetime.now(timezone.utc).isoformat(), str(phone), session["name"],
         pname, qty, total, session["address"], order_id,
     ])
     clear_session(phone)
@@ -422,7 +422,7 @@ def finalize_order(phone, session, platform="whatsapp"):
         f"Hum jald aap se rabta karenge.",
     )
 
-    if OWNER_PHONE and OWNER_PHONE != phone:
+    if OWNER_PHONE and str(OWNER_PHONE) != str(phone):
         send_whatsapp_message(
             OWNER_PHONE,
             f"🆕 Naya order {order_id} ({platform.upper()})\n"
@@ -546,9 +546,10 @@ async def receive_webhook(request: Request):
                             send_reply_to_user(sender_id, platform, "Order cancel kar diya gaya. Catalog dekhne ke liye 'catalog' likhein.")
                         elif session and session["step"] != "confirm":
                             handle_order_step(sender_id, msg_body, session, platform)
-                        elif "catalog" in command or "order" in command or "products" in command:
-                            # Send text catalog overview for Instagram/Messenger
+                        elif "catalog" in command or "order" in command or "products" in command or "shop" in command:
                             send_reply_to_user(sender_id, platform, f"Hamare brands aur products:\n{CATALOG_TEXT}\n\nKoi item khareedne ke liye uska naam ya brand likhein.")
+                        elif command in PRODUCTS:
+                            start_order(sender_id, command, platform)
                         else:
                             ai_text = await asyncio.to_thread(ask_ai, sender_id)
                             send_reply_to_user(sender_id, platform, ai_text)
@@ -610,7 +611,9 @@ def send_instagram_message(recipient_id, message_text):
         "message": {"text": message_text}
     }
     try:
-        requests.post(url, params=params, json=payload, timeout=30)
+        r = requests.post(url, params=params, json=payload, timeout=30)
+        if r.status_code != 200:
+            logging.error(f"Instagram send error {r.status_code}: {r.text}")
     except Exception as e:
         logging.error(f"Error sending Instagram message: {e}")
 
@@ -624,7 +627,9 @@ def send_messenger_message(recipient_id, message_text):
         "message": {"text": message_text}
     }
     try:
-        requests.post(url, params=params, json=payload, timeout=30)
+        r = requests.post(url, params=params, json=payload, timeout=30)
+        if r.status_code != 200:
+            logging.error(f"Messenger send error {r.status_code}: {r.text}")
     except Exception as e:
         logging.error(f"Error sending Messenger message: {e}")
 
