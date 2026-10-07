@@ -41,16 +41,50 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_PHONE = os.getenv("OWNER_PHONE")  # maslan 923001234567 (+ ke baghair)
 
-# ---------- Products (yahan apni asli items likhein) ----------
+# ---------- Brands aur Items (yahan apni asli cheezein likhein) ----------
+# Qaide: har item ki "id" poore catalog mein alag ho (chhote harf aur _ mein),
+# item/brand "title" 24 harf tak, ek brand mein 10 items tak, 10 brands tak.
+# "price" sirf number ho (1500, na "1500" na 1,500).
 CURRENCY = "Rs"
-PRODUCTS = {
-    "Gul-Ahmed": {"title": "Gul-Ahmed - Special Deal", "price": 1500,
-               "desc": "Best price and high quality."},
-    "Lucky-Garm": {"title": "Lucky-Garm - Standard Pack", "price": 1000,
-               "desc": "Perfect for daily use."},
+BRANDS = {
+    "gul_ahmed": {
+        "title": "Gul Ahmed",
+        "desc": "Lawn aur ready to wear",
+        "items": {
+            "ga_1": {"title": "Item 1 (asli naam)", "price": 1500,
+                     "desc": "Yahan asli tafseel likhein"},
+            "ga_2": {"title": "Item 2 (asli naam)", "price": 2500,
+                     "desc": "Yahan asli tafseel likhein"},
+        },
+    },
+    "lucky_garments": {
+        "title": "Lucky Garments",
+        "desc": "Roz marra ke kapde",
+        "items": {
+            "lg_1": {"title": "Item 1 (asli naam)", "price": 1000,
+                     "desc": "Yahan asli tafseel likhein"},
+            "lg_2": {"title": "Item 2 (asli naam)", "price": 1800,
+                     "desc": "Yahan asli tafseel likhein"},
+        },
+    },
 }
-CATALOG_TEXT = "; ".join(
-    f"{p['title']} ({CURRENCY} {p['price']})" for p in PRODUCTS.values()
+
+# Flat list (order flow isi se kaam karta hai)
+PRODUCTS = {}
+for _bid, _b in BRANDS.items():
+    for _pid, _it in _b["items"].items():
+        PRODUCTS[_pid] = {**_it, "brand": _b["title"], "brand_id": _bid}
+
+
+def product_name(p):
+    return f"{p['brand']} - {p['title']}"
+
+
+CATALOG_TEXT = " | ".join(
+    f"{b['title']}: " + ", ".join(
+        f"{i['title']} ({CURRENCY} {i['price']})" for i in b["items"].values()
+    )
+    for b in BRANDS.values()
 )
 SESSION_TIMEOUT_MIN = 30
 
@@ -58,7 +92,7 @@ SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
     "Jawab chhota rakho (2-4 jumle), saada text mein, heading ya markdown ke baghair. "
-    f"Hamare products: {CATALOG_TEXT}. Sirf inhi products aur qeematon ki baat karo, koi aur qeemat na banao. "
+    f"Hamare brands aur products: {CATALOG_TEXT}. Sirf inhi products aur qeematon ki baat karo, koi aur qeemat na banao. "
     "Order lene ke liye user ko 'catalog' likhne ko kaho."
 )
 FIXED_COMMANDS = ["help", "status", "about"]
@@ -301,7 +335,7 @@ def start_order(phone, product_id):
     save_session(phone, product_id, "qty")
     send_whatsapp_message(
         phone,
-        f"Aapne chuna: {product['title']} ({CURRENCY} {product['price']}).\n"
+        f"Aapne chuna: {product_name(product)} ({CURRENCY} {product['price']}).\n"
         "Kitni quantity chahiye? Number likhein (maslan 2).\n"
         "Order rokne ke liye 'cancel' likhein.",
     )
@@ -338,7 +372,7 @@ def handle_order_step(phone, raw_text, session):
             total = session["qty"] * product["price"]
             summary = (
                 "Aapka order:\n"
-                f"{product['title']} x {session['qty']}\n"
+                f"{product_name(product)} x {session['qty']}\n"
                 f"Total: {CURRENCY} {total}\n"
                 f"Naam: {session['name']}\n"
                 f"Pata: {address}\n\n"
@@ -361,10 +395,11 @@ def finalize_order(phone, session):
     qty = session["qty"]
     total = qty * product["price"]
     order_id = "AO-" + datetime.now().strftime("%m%d%H%M%S")
+    pname = product_name(product)
 
     log_order_to_sheet([
         datetime.now(timezone.utc).isoformat(), phone, session["name"],
-        product["title"], qty, total, session["address"], order_id,
+        pname, qty, total, session["address"], order_id,
     ])
     clear_session(phone)
 
@@ -372,7 +407,7 @@ def finalize_order(phone, session):
         phone,
         f"Shukriya! Aapka order confirm ho gaya hai ✅\n"
         f"Order ID: {order_id}\n"
-        f"{product['title']} x {qty} = {CURRENCY} {total}\n"
+        f"{pname} x {qty} = {CURRENCY} {total}\n"
         "Hum jald aap se rabta karenge.",
     )
 
@@ -381,7 +416,7 @@ def finalize_order(phone, session):
             OWNER_PHONE,
             f"🆕 Naya order {order_id}\n"
             f"Customer: {session['name']} ({phone})\n"
-            f"{product['title']} x {qty} = {CURRENCY} {total}\n"
+            f"{pname} x {qty} = {CURRENCY} {total}\n"
             f"Pata: {session['address']}",
         )
 
@@ -467,10 +502,12 @@ async def receive_webhook(request: Request):
                     handle_order_step(sender_phone, raw_text, session)
                 elif command in FIXED_COMMANDS:
                     send_whatsapp_message(sender_phone, get_reply(command))
+                elif command.startswith("brand_") and command[6:] in BRANDS:
+                    send_item_list(sender_phone, command[6:])
                 elif command in PRODUCTS:
                     start_order(sender_phone, command)
                 elif any(word in command for word in ["order", "kharidna", "catalog", "products", "shop"]):
-                    send_product_list(sender_phone)
+                    send_catalog(sender_phone)
                 else:
                     ai_text = await asyncio.to_thread(ask_ai, sender_phone)
                     send_whatsapp_message(sender_phone, ai_text)
@@ -487,7 +524,7 @@ def get_reply(command):
         return (
             "Aap yeh commands use kar sakte hain:\n"
             "1. hi / hello / menu\n2. help\n3. status\n4. about\n"
-            "5. catalog / order (Products dekhne aur order karne ke liye)\n"
+            "5. catalog / order (Brands dekhne aur order karne ke liye)\n"
             "6. cancel (order rokne ke liye)\n"
             "Koi bhi sawal seedha likh dein, ya image / PDF bhej dein, AI jawab dega."
         )
@@ -562,16 +599,24 @@ def send_confirm_buttons(recipient_phone, summary_text):
     })
 
 
-def send_product_list(recipient_phone):
+def send_catalog(recipient_phone):
+    """Ek hi brand ho toh seedha items, warna pehle brands ki list."""
+    if len(BRANDS) == 1:
+        send_item_list(recipient_phone, next(iter(BRANDS)))
+    else:
+        send_brand_list(recipient_phone)
+
+
+def send_brand_list(recipient_phone):
     try:
-        save_message(recipient_phone, "out", "[product catalog menu]")
+        save_message(recipient_phone, "out", "[brand list]")
         rows = [
             {
-                "id": pid,
-                "title": p["title"][:24],
-                "description": f"{CURRENCY} {p['price']} - {p['desc']}"[:72],
+                "id": f"brand_{bid}",
+                "title": b["title"][:24],
+                "description": (b.get("desc") or f"{len(b['items'])} items")[:72],
             }
-            for pid, p in PRODUCTS.items()
+            for bid, b in BRANDS.items()
         ][:10]
         send_payload({
             "messaging_product": "whatsapp",
@@ -579,18 +624,51 @@ def send_product_list(recipient_phone):
             "type": "interactive",
             "interactive": {
                 "type": "list",
-                "header": {"type": "text", "text": "🛍️ Product Catalog"},
-                "body": {
-                    "text": "Neeche diye gaye button par click karke hamari items dekhein aur order select karein:"},
+                "header": {"type": "text", "text": "🛍️ Hamare Brands"},
+                "body": {"text": "Pehle brand chunein, phir uski items dekhein:"},
                 "footer": {"text": "Powered by Apex Order Bot"},
                 "action": {
-                    "button": "Catalog Dekhein",
-                    "sections": [{"title": "Available Items", "rows": rows}],
+                    "button": "Brands Dekhein",
+                    "sections": [{"title": "Brands", "rows": rows}],
                 },
             },
         })
     except Exception as e:
-        logging.error(f"Error sending product list: {e}")
+        logging.error(f"Error sending brand list: {e}")
+
+
+def send_item_list(recipient_phone, brand_id):
+    try:
+        brand = BRANDS[brand_id]
+        if not brand["items"]:
+            send_whatsapp_message(recipient_phone, "Is brand ki items abhi available nahi hain.")
+            return
+        save_message(recipient_phone, "out", "[item list]")
+        rows = [
+            {
+                "id": pid,
+                "title": p["title"][:24],
+                "description": f"{CURRENCY} {p['price']} - {p['desc']}"[:72],
+            }
+            for pid, p in brand["items"].items()
+        ][:10]
+        send_payload({
+            "messaging_product": "whatsapp",
+            "to": recipient_phone,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "header": {"type": "text", "text": f"🛍️ {brand['title']}"[:60]},
+                "body": {"text": "Item chunein, phir quantity, naam aur pata poochha jayega:"},
+                "footer": {"text": "Doosra brand dekhne ke liye 'catalog' likhein"},
+                "action": {
+                    "button": "Items Dekhein",
+                    "sections": [{"title": "Available Items"[:24], "rows": rows}],
+                },
+            },
+        })
+    except Exception as e:
+        logging.error(f"Error sending item list: {e}")
 
 
 if __name__ == "__main__":
