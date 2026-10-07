@@ -39,14 +39,30 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+OWNER_PHONE = os.getenv("OWNER_PHONE")  # maslan 923001234567 (+ ke baghair)
+
+# ---------- Products (yahan apni asli items likhein) ----------
+CURRENCY = "Rs"
+PRODUCTS = {
+    "Gul-Ahmed": {"title": "Gul-Ahmed - Special Deal", "price": 1500,
+               "desc": "Best price and high quality."},
+    "Lucky-Garm": {"title": "Lucky-Garm - Standard Pack", "price": 1000,
+               "desc": "Perfect for daily use."},
+}
+CATALOG_TEXT = "; ".join(
+    f"{p['title']} ({CURRENCY} {p['price']})" for p in PRODUCTS.values()
+)
+SESSION_TIMEOUT_MIN = 30
 
 SYSTEM_PROMPT = (
     "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional WhatsApp assistant ho. "
     "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
     "Jawab chhota rakho (2-4 jumle), saada text mein, heading ya markdown ke baghair. "
-    "User ko products dekhne, catalog open karne aur orders place karne mein madad karo."
+    f"Hamare products: {CATALOG_TEXT}. Sirf inhi products aur qeematon ki baat karo, koi aur qeemat na banao. "
+    "Order lene ke liye user ko 'catalog' likhne ko kaho."
 )
 FIXED_COMMANDS = ["help", "status", "about"]
+GREETINGS = ["hi", "hello", "salam", "menu"]
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
@@ -77,11 +93,14 @@ except Exception as e:
     logging.error(f"Google Sheets connection error: {e}")
 
 
-def log_order_to_sheet(user_phone, order_details):
+def log_order_to_sheet(row):
+    """row = [time, phone, name, product, qty, total, address, order_id]"""
     try:
         if sheet:
-            sheet.append_row([user_phone, order_details, datetime.now(timezone.utc).isoformat()])
-            logging.info(f"Order logged to sheet for {user_phone}")
+            sheet.append_row(row)
+            logging.info(f"Order logged to sheet: {row[-1]}")
+        else:
+            logging.error("Sheet connected nahi, order sheet mein save nahi hua.")
     except Exception as e:
         logging.error(f"Error saving to sheet: {e}")
 
@@ -98,6 +117,17 @@ def init_db():
                     direction TEXT NOT NULL,
                     text TEXT,
                     created_at TEXT NOT NULL
+                )"""
+            )
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS order_sessions (
+                    phone TEXT PRIMARY KEY,
+                    product_id TEXT,
+                    step TEXT,
+                    qty INTEGER,
+                    name TEXT,
+                    address TEXT,
+                    updated_at TEXT
                 )"""
             )
             conn.commit()
@@ -145,6 +175,56 @@ def get_history(phone, limit=6):
     except Exception as e:
         logging.error(f"Error fetching history for {phone}: {e}")
         return []
+
+
+# ---------- Order sessions ----------
+def get_session(phone):
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT product_id, step, qty, name, address, updated_at "
+                "FROM order_sessions WHERE phone=?",
+                (phone,),
+            ).fetchone()
+        if not row:
+            return None
+        s = dict(zip(
+            ["product_id", "step", "qty", "name", "address", "updated_at"], row))
+        age = datetime.now(timezone.utc) - datetime.fromisoformat(s["updated_at"])
+        if age.total_seconds() > SESSION_TIMEOUT_MIN * 60:
+            clear_session(phone)
+            return None
+        if s["product_id"] not in PRODUCTS:
+            clear_session(phone)
+            return None
+        return s
+    except Exception as e:
+        logging.error(f"get_session error: {e}")
+        return None
+
+
+def save_session(phone, product_id, step, qty=None, name=None, address=None):
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO order_sessions "
+                "(phone, product_id, step, qty, name, address, updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (phone, product_id, step, qty, name, address,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+            conn.commit()
+    except Exception as e:
+        logging.error(f"save_session error: {e}")
+
+
+def clear_session(phone):
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            conn.execute("DELETE FROM order_sessions WHERE phone=?", (phone,))
+            conn.commit()
+    except Exception as e:
+        logging.error(f"clear_session error: {e}")
 
 
 init_db()
@@ -215,6 +295,97 @@ def ask_ai(phone, media_id=None, caption=""):
     return text
 
 
+# ---------- Order flow ----------
+def start_order(phone, product_id):
+    product = PRODUCTS[product_id]
+    save_session(phone, product_id, "qty")
+    send_whatsapp_message(
+        phone,
+        f"Aapne chuna: {product['title']} ({CURRENCY} {product['price']}).\n"
+        "Kitni quantity chahiye? Number likhein (maslan 2).\n"
+        "Order rokne ke liye 'cancel' likhein.",
+    )
+
+
+def handle_order_step(phone, raw_text, session):
+    step = session["step"]
+    pid = session["product_id"]
+
+    if step == "qty":
+        if raw_text.isdigit() and 1 <= int(raw_text) <= 99:
+            save_session(phone, pid, "name", qty=int(raw_text))
+            send_whatsapp_message(phone, "Shukriya! Ab apna naam likhein.")
+        else:
+            send_whatsapp_message(
+                phone,
+                "Meherbani karke quantity sirf number mein likhein (maslan 2). "
+                "Order rokne ke liye 'cancel' likhein.",
+            )
+
+    elif step == "name":
+        if len(raw_text) >= 2:
+            save_session(phone, pid, "address", qty=session["qty"], name=raw_text[:60])
+            send_whatsapp_message(phone, "Ab delivery ka mukammal pata likhein.")
+        else:
+            send_whatsapp_message(phone, "Meherbani karke apna naam sahi likhein.")
+
+    elif step == "address":
+        if len(raw_text) >= 8:
+            address = raw_text[:200]
+            save_session(phone, pid, "confirm", qty=session["qty"],
+                         name=session["name"], address=address)
+            product = PRODUCTS[pid]
+            total = session["qty"] * product["price"]
+            summary = (
+                "Aapka order:\n"
+                f"{product['title']} x {session['qty']}\n"
+                f"Total: {CURRENCY} {total}\n"
+                f"Naam: {session['name']}\n"
+                f"Pata: {address}\n\n"
+                "Kya order confirm karein?"
+            )
+            send_confirm_buttons(phone, summary)
+        else:
+            send_whatsapp_message(phone, "Meherbani karke pata thoda mukammal likhein.")
+
+    else:  # confirm step par user ne button ke bajaye text likha
+        send_whatsapp_message(
+            phone,
+            "Order confirm ya cancel karne ke liye upar wale button dabayein, "
+            "ya 'cancel' likhein.",
+        )
+
+
+def finalize_order(phone, session):
+    product = PRODUCTS[session["product_id"]]
+    qty = session["qty"]
+    total = qty * product["price"]
+    order_id = "AO-" + datetime.now().strftime("%m%d%H%M%S")
+
+    log_order_to_sheet([
+        datetime.now(timezone.utc).isoformat(), phone, session["name"],
+        product["title"], qty, total, session["address"], order_id,
+    ])
+    clear_session(phone)
+
+    send_whatsapp_message(
+        phone,
+        f"Shukriya! Aapka order confirm ho gaya hai ✅\n"
+        f"Order ID: {order_id}\n"
+        f"{product['title']} x {qty} = {CURRENCY} {total}\n"
+        "Hum jald aap se rabta karenge.",
+    )
+
+    if OWNER_PHONE and OWNER_PHONE != phone:
+        send_whatsapp_message(
+            OWNER_PHONE,
+            f"🆕 Naya order {order_id}\n"
+            f"Customer: {session['name']} ({phone})\n"
+            f"{product['title']} x {qty} = {CURRENCY} {total}\n"
+            f"Pata: {session['address']}",
+        )
+
+
 # ---------- Webhook ----------
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -244,9 +415,11 @@ async def receive_webhook(request: Request):
                 media_id = None
                 caption = ""
                 command = ""
+                raw_text = ""
 
                 if msg_type == "text":
-                    command = message["text"]["body"].strip().lower()
+                    raw_text = message["text"]["body"].strip()
+                    command = raw_text.lower()
                 elif msg_type == "interactive":
                     interactive_data = message.get("interactive", {})
                     if "button_reply" in interactive_data:
@@ -270,21 +443,32 @@ async def receive_webhook(request: Request):
                 if not save_message(sender_phone, "in", command, message.get("id")):
                     continue
 
+                session = get_session(sender_phone)
+
                 # --- SMART ROUTING ---
                 if media_id:
                     ai_text = await asyncio.to_thread(ask_ai, sender_phone, media_id, caption)
                     send_whatsapp_message(sender_phone, ai_text)
-                elif command in ["hi", "hello", "salam", "menu"]:
+                elif command == "order_confirm":
+                    if session and session["step"] == "confirm":
+                        finalize_order(sender_phone, session)
+                    else:
+                        send_whatsapp_message(
+                            sender_phone,
+                            "Koi active order nahi hai. Naya order shuru karne ke liye 'catalog' likhein.")
+                elif command in ["order_cancel", "cancel"]:
+                    clear_session(sender_phone)
+                    send_whatsapp_message(
+                        sender_phone, "Order cancel kar diya gaya. Dobara shuru karne ke liye 'catalog' likhein.")
+                elif command in GREETINGS:
+                    clear_session(sender_phone)
                     send_buttons(sender_phone)
+                elif session and msg_type == "text":
+                    handle_order_step(sender_phone, raw_text, session)
                 elif command in FIXED_COMMANDS:
                     send_whatsapp_message(sender_phone, get_reply(command))
-                elif command in ["item_1", "item_2"]:
-                    order_text = f"Selected Product ID: {command}"
-                    log_order_to_sheet(sender_phone, order_text)
-                    send_whatsapp_message(
-                        sender_phone,
-                        f"Shukriya! Aapka order ({command}) record kar liya gaya hai. Hum jald rabta karenge."
-                    )
+                elif command in PRODUCTS:
+                    start_order(sender_phone, command)
                 elif any(word in command for word in ["order", "kharidna", "catalog", "products", "shop"]):
                     send_product_list(sender_phone)
                 else:
@@ -303,7 +487,8 @@ def get_reply(command):
         return (
             "Aap yeh commands use kar sakte hain:\n"
             "1. hi / hello / menu\n2. help\n3. status\n4. about\n"
-            "5. catalog / order (Products dekhne ke liye)\n"
+            "5. catalog / order (Products dekhne aur order karne ke liye)\n"
+            "6. cancel (order rokne ke liye)\n"
             "Koi bhi sawal seedha likh dein, ya image / PDF bhej dein, AI jawab dega."
         )
     if command == "status":
@@ -358,9 +543,36 @@ def send_buttons(recipient_phone):
     })
 
 
+def send_confirm_buttons(recipient_phone, summary_text):
+    save_message(recipient_phone, "out", "[order summary]")
+    send_payload({
+        "messaging_product": "whatsapp",
+        "to": recipient_phone,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": summary_text[:1000]},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": "order_confirm", "title": "Confirm"}},
+                    {"type": "reply", "reply": {"id": "order_cancel", "title": "Cancel"}},
+                ]
+            },
+        },
+    })
+
+
 def send_product_list(recipient_phone):
     try:
         save_message(recipient_phone, "out", "[product catalog menu]")
+        rows = [
+            {
+                "id": pid,
+                "title": p["title"][:24],
+                "description": f"{CURRENCY} {p['price']} - {p['desc']}"[:72],
+            }
+            for pid, p in PRODUCTS.items()
+        ][:10]
         send_payload({
             "messaging_product": "whatsapp",
             "to": recipient_phone,
@@ -373,19 +585,9 @@ def send_product_list(recipient_phone):
                 "footer": {"text": "Powered by Apex Order Bot"},
                 "action": {
                     "button": "Catalog Dekhein",
-                    "sections": [
-                        {
-                            "title": "Available Items",
-                            "rows": [
-                                {"id": "item_1", "title": "Item 1 - Special Deal",
-                                 "description": "Best price and high quality."},
-                                {"id": "item_2", "title": "Item 2 - Standard Pack",
-                                 "description": "Perfect for daily use."}
-                            ]
-                        }
-                    ]
-                }
-            }
+                    "sections": [{"title": "Available Items", "rows": rows}],
+                },
+            },
         })
     except Exception as e:
         logging.error(f"Error sending product list: {e}")
