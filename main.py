@@ -41,7 +41,18 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_PHONE = os.getenv("OWNER_PHONE")  # maslan 923001234567 (+ ke baghair)
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", WHATSAPP_TOKEN)  # Instagram aur Messenger ke liye
+
+# Instagram aur Messenger ke liye PAGE ka access token (WhatsApp wala nahi)
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", WHATSAPP_TOKEN)
+# Sirf tab set karein jab Instagram "Instagram Login" wale tareeqe se juda ho
+INSTAGRAM_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+# Debugging: poora webhook payload log karta hai. Sab theek hone par Railway mein 0 kar dein.
+DEBUG_WEBHOOK = os.getenv("DEBUG_WEBHOOK", "1") == "1"
+
+if not os.getenv("PAGE_ACCESS_TOKEN"):
+    logging.warning(
+        "PAGE_ACCESS_TOKEN set nahi hai: Instagram/Messenger replies fail hongi."
+    )
 
 # ---------- Brands aur Items ----------
 CURRENCY = "Rs"
@@ -72,6 +83,8 @@ for _bid, _b in BRANDS.items():
     for _pid, _it in _b["items"].items():
         PRODUCTS[_pid] = {**_it, "brand": _b["title"], "brand_id": _bid}
 
+PRODUCT_ORDER = list(PRODUCTS.keys())  # numbered catalog isi tarteeb mein
+
 
 def product_name(p):
     return f"{p['brand']} - {p['title']}"
@@ -95,6 +108,8 @@ SYSTEM_PROMPT = (
 )
 FIXED_COMMANDS = ["help", "status", "about"]
 GREETINGS = ["hi", "hello", "salam", "menu"]
+CATALOG_WORDS = ["order", "kharidna", "catalog", "products", "shop"]
+CONFIRM_WORDS = {"confirm", "yes", "haan", "han", "ha", "ok", "okay"}
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
@@ -263,6 +278,70 @@ def clear_session(phone):
 init_db()
 
 
+# ---------- Instagram / Messenger ke liye text catalog ----------
+CATALOG_HEADER = "🛍️ Hamare Products"
+
+
+def build_social_catalog():
+    lines = [CATALOG_HEADER, ""]
+    n = 1
+    for b in BRANDS.values():
+        lines.append(b["title"])
+        for it in b["items"].values():
+            lines.append(f"{n}. {it['title']} - {CURRENCY} {it['price']}")
+            n += 1
+        lines.append("")
+    lines.append("Order ke liye item ka number ya naam likhein (maslan 1).")
+    return "\n".join(lines)
+
+
+def last_out_is_catalog(phone):
+    """Kya bot ka aakhri message catalog tha? (tab number se item chunna theek hai)"""
+    try:
+        with closing(sqlite3.connect(DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT text FROM messages WHERE phone=? AND direction='out' "
+                "ORDER BY id DESC LIMIT 1",
+                (str(phone),),
+            ).fetchone()
+        return bool(row and row[0] and row[0].startswith(CATALOG_HEADER))
+    except Exception:
+        return False
+
+
+def find_product(text, allow_number=False):
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    if t in PRODUCTS:
+        return t
+    if t.isdigit():
+        if allow_number and 1 <= int(t) <= len(PRODUCT_ORDER):
+            return PRODUCT_ORDER[int(t) - 1]
+        return None
+    matches = []
+    for pid, p in PRODUCTS.items():
+        title = p["title"].lower()
+        if t == title or title in t or (len(t) >= 5 and t in title):
+            matches.append(pid)
+    return matches[0] if len(matches) == 1 else None
+
+
+def split_text(text, max_bytes):
+    """Lambay message ko bytes ke hisaab se hisson mein todta hai."""
+    chunks, cur, cur_bytes = [], "", 0
+    for ch in text:
+        b = len(ch.encode("utf-8"))
+        if cur_bytes + b > max_bytes:
+            chunks.append(cur)
+            cur, cur_bytes = "", 0
+        cur += ch
+        cur_bytes += b
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
+
+
 # ---------- WhatsApp media download ----------
 def download_media(media_id):
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
@@ -336,6 +415,7 @@ def send_reply_to_user(phone, platform, text_msg):
     elif platform == "messenger":
         send_messenger_message(phone, text_msg)
 
+
 def start_order(phone, product_id, platform="whatsapp"):
     product = PRODUCTS[product_id]
     save_session(phone, product_id, "qty")
@@ -383,14 +463,20 @@ def handle_order_step(phone, raw_text, session, platform="whatsapp"):
                 f"Total: {CURRENCY} {total}\n"
                 f"Naam: {session['name']}\n"
                 f"Pata: {address}\n\n"
-                "Kya order confirm karein? (Confirm ya Cancel likhein)"
+                "Kya order confirm karein?"
             )
-            send_reply_to_user(phone, platform, summary)
+            if platform == "whatsapp":
+                send_confirm_buttons(phone, summary)
+            else:
+                send_reply_to_user(
+                    phone, platform,
+                    summary + " 'Confirm' ya 'Cancel' likhein.")
         else:
             send_reply_to_user(phone, platform, "Meherbani karke pata thoda mukammal likhein.")
 
     else:  # confirm step
-        if "confirm" in raw_text.lower():
+        low = raw_text.lower().strip()
+        if low in CONFIRM_WORDS or "confirm" in low:
             finalize_order(phone, session, platform)
         else:
             send_reply_to_user(
@@ -432,6 +518,38 @@ def finalize_order(phone, session, platform="whatsapp"):
         )
 
 
+# ---------- Instagram / Messenger text handler ----------
+async def handle_social_text(sender_id, text, platform):
+    command = text.lower().strip()
+    session = get_session(sender_id)
+
+    if command in ["cancel", "order_cancel"]:
+        clear_session(sender_id)
+        send_reply_to_user(
+            sender_id, platform,
+            "Order cancel kar diya gaya. Catalog dekhne ke liye 'catalog' likhein.")
+    elif command in GREETINGS:
+        clear_session(sender_id)
+        send_reply_to_user(
+            sender_id, platform,
+            "Assalam-o-Alaikum! 👋 Main Apex Order Bot hoon.\n"
+            "Products dekhne ke liye 'catalog' likhein, madad ke liye 'help' likhein, "
+            "ya koi bhi sawal pooch lein.")
+    elif session:
+        handle_order_step(sender_id, text, session, platform)
+    elif command in FIXED_COMMANDS:
+        send_reply_to_user(sender_id, platform, get_reply(command, platform))
+    elif any(word in command for word in CATALOG_WORDS):
+        send_reply_to_user(sender_id, platform, build_social_catalog())
+    else:
+        pid = find_product(text, allow_number=last_out_is_catalog(sender_id))
+        if pid:
+            start_order(sender_id, pid, platform)
+        else:
+            ai_text = await asyncio.to_thread(ask_ai, sender_id)
+            send_reply_to_user(sender_id, platform, ai_text)
+
+
 # ---------- Webhook Endpoints ----------
 @app.get("/webhook")
 async def verify_webhook(request: Request):
@@ -449,6 +567,8 @@ async def receive_webhook(request: Request):
     try:
         body = await request.json()
         object_type = body.get("object")
+        if DEBUG_WEBHOOK:
+            logging.info(f"WEBHOOK object={object_type}: {json.dumps(body)[:1500]}")
 
         # 1. WhatsApp Handler
         if object_type == "whatsapp_business_account":
@@ -520,7 +640,7 @@ async def receive_webhook(request: Request):
                         send_item_list(sender_phone, command[6:])
                     elif command in PRODUCTS:
                         start_order(sender_phone, command, "whatsapp")
-                    elif any(word in command for word in ["order", "kharidna", "catalog", "products", "shop"]):
+                    elif any(word in command for word in CATALOG_WORDS):
                         send_catalog(sender_phone)
                     else:
                         ai_text = await asyncio.to_thread(ask_ai, sender_phone)
@@ -528,31 +648,33 @@ async def receive_webhook(request: Request):
 
         # 2. Instagram & 3. Messenger Handler
         elif object_type in ["instagram", "page"]:
+            platform = "instagram" if object_type == "instagram" else "messenger"
             for entry in body.get("entry", []):
-                for messaging in entry.get("messaging", []):
-                    if "message" in messaging:
-                        sender_id = messaging["sender"]["id"]
-                        msg_body = messaging["message"].get("text", "").strip()
-                        if not msg_body:
+                for event in entry.get("messaging", []):
+                    try:
+                        msg = event.get("message")
+                        sender_id = (event.get("sender") or {}).get("id")
+                        if not msg or not sender_id:
+                            continue  # read/delivery/postback wagera abhi ignore
+                        # Bot ke apne bheje messages (echo) ignore karein
+                        if msg.get("is_echo") or str(sender_id) == str(entry.get("id")):
                             continue
 
-                        platform = "instagram" if object_type == "instagram" else "messenger"
-                        command = msg_body.lower()
-                        save_message(sender_id, "in", msg_body)
-                        session = get_session(sender_id)
+                        text = (msg.get("text") or "").strip()
+                        if not text:
+                            send_reply_to_user(
+                                sender_id, platform,
+                                "Abhi main sirf text messages samajh sakta hoon.")
+                            continue
 
-                        if command in ["cancel", "order_cancel"]:
-                            clear_session(sender_id)
-                            send_reply_to_user(sender_id, platform, "Order cancel kar diya gaya. Catalog dekhne ke liye 'catalog' likhein.")
-                        elif session and session["step"] != "confirm":
-                            handle_order_step(sender_id, msg_body, session, platform)
-                        elif "catalog" in command or "order" in command or "products" in command or "shop" in command:
-                            send_reply_to_user(sender_id, platform, f"Hamare brands aur products:\n{CATALOG_TEXT}\n\nKoi item khareedne ke liye uska naam ya brand likhein.")
-                        elif command in PRODUCTS:
-                            start_order(sender_id, command, platform)
-                        else:
-                            ai_text = await asyncio.to_thread(ask_ai, sender_id)
-                            send_reply_to_user(sender_id, platform, ai_text)
+                        # Duplicate delivery se bachne ke liye message id se dedupe
+                        if not save_message(sender_id, "in", text, msg.get("mid")):
+                            continue
+
+                        logging.info(f"{platform} message from {sender_id}: {text[:80]}")
+                        await handle_social_text(str(sender_id), text, platform)
+                    except Exception as e:
+                        logging.error(f"Error handling {platform} event: {e}")
 
     except Exception as e:
         logging.error(f"Error parsing webhook message: {e}")
@@ -561,14 +683,22 @@ async def receive_webhook(request: Request):
 
 
 # ---------- Bot logic ----------
-def get_reply(command):
+def get_reply(command, platform="whatsapp"):
     if command == "help":
+        if platform == "whatsapp":
+            return (
+                "Aap yeh commands use kar sakte hain:\n"
+                "1. hi / hello / menu\n2. help\n3. status\n4. about\n"
+                "5. catalog / order (Brands dekhne aur order karne ke liye)\n"
+                "6. cancel (order rokne ke liye)\n"
+                "Koi bhi sawal seedha likh dein, ya image / PDF bhej dein, AI jawab dega."
+            )
         return (
-            "Aap yeh commands use kar sakte hain:\n"
-            "1. hi / hello / menu\n2. help\n3. status\n4. about\n"
-            "5. catalog / order (Brands dekhne aur order karne ke liye)\n"
+            "Aap yeh likh sakte hain:\n"
+            "1. hi / menu\n2. help\n3. status\n4. about\n"
+            "5. catalog (products dekhne aur order karne ke liye)\n"
             "6. cancel (order rokne ke liye)\n"
-            "Koi bhi sawal seedha likh dein, ya image / PDF bhej dein, AI jawab dega."
+            "Koi bhi sawal seedha likh dein, AI jawab dega."
         )
     if command == "status":
         return "Bot bilkul theek aur active halat mein kaam kar raha hai!"
@@ -602,36 +732,41 @@ def send_whatsapp_message(recipient_phone, message_text):
     })
 
 
-def send_instagram_message(recipient_id, message_text):
+def _send_social(platform, recipient_id, message_text):
     save_message(recipient_id, "out", message_text)
-    url = "https://graph.facebook.com/v20.0/me/messages"
-    params = {"access_token": PAGE_ACCESS_TOKEN}
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": message_text}
+
+    if platform == "instagram" and INSTAGRAM_TOKEN:
+        url = "https://graph.instagram.com/v20.0/me/messages"
+        token = INSTAGRAM_TOKEN
+    else:
+        url = "https://graph.facebook.com/v20.0/me/messages"
+        token = PAGE_ACCESS_TOKEN
+    limit = 900 if platform == "instagram" else 1900  # IG: 1000 bytes, Messenger: 2000 chars
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
     }
-    try:
-        r = requests.post(url, params=params, json=payload, timeout=30)
-        if r.status_code != 200:
-            logging.error(f"Instagram send error {r.status_code}: {r.text}")
-    except Exception as e:
-        logging.error(f"Error sending Instagram message: {e}")
+    for part in split_text(message_text, limit):
+        payload = {"recipient": {"id": recipient_id}, "message": {"text": part}}
+        if platform == "messenger":
+            payload["messaging_type"] = "RESPONSE"
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=30)
+            if r.status_code == 200:
+                logging.info(f"{platform} send OK to {recipient_id}")
+            else:
+                logging.error(f"{platform} send error {r.status_code}: {r.text}")
+        except Exception as e:
+            logging.error(f"Error sending {platform} message: {e}")
+
+
+def send_instagram_message(recipient_id, message_text):
+    _send_social("instagram", recipient_id, message_text)
 
 
 def send_messenger_message(recipient_id, message_text):
-    save_message(recipient_id, "out", message_text)
-    url = "https://graph.facebook.com/v20.0/me/messages"
-    params = {"access_token": PAGE_ACCESS_TOKEN}
-    payload = {
-        "recipient": {"id": recipient_id},
-        "message": {"text": message_text}
-    }
-    try:
-        r = requests.post(url, params=params, json=payload, timeout=30)
-        if r.status_code != 200:
-            logging.error(f"Messenger send error {r.status_code}: {r.text}")
-    except Exception as e:
-        logging.error(f"Error sending Messenger message: {e}")
+    _send_social("messenger", recipient_id, message_text)
 
 
 def send_buttons(recipient_phone):
