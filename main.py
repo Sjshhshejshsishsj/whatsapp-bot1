@@ -444,7 +444,7 @@ def start_order(phone, product_id, platform="whatsapp"):
     save_session(phone, product_id, "qty")
     msg = (
         f"Aapne chuna: {product_name(product)} ({CURRENCY} {product['price']}).\n"
-        "Kitni quantity chahiye? Number likhein (maslan 2).\n"
+        "Kitni quantity chahiye? \n"
         "Order rokne ke liye 'cancel' likhein."
     )
     send_reply_to_user(phone, platform, msg)
@@ -462,7 +462,7 @@ def handle_order_step(phone, raw_text, session, platform="whatsapp"):
             send_reply_to_user(
                 phone,
                 platform,
-                "Meherbani karke quantity sirf number mein likhein (maslan 2). "
+                "Meherbani karke quantity sirf number mein likhein. "
                 "Order rokne ke liye 'cancel' likhein.",
             )
 
