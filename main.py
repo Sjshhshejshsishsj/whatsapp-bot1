@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 import sys
 
 sqlite3_imported = True
@@ -36,16 +37,26 @@ logging.basicConfig(
 
 app = FastAPI()
 
+
+def normalize_phone(raw):
+    """Number ko sirf ankon mein badalta hai. Pakistani 03XXXXXXXXX ko 923XXXXXXXXX banata hai."""
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits.startswith("0") and len(digits) == 11:
+        digits = "92" + digits[1:]
+    return digits
+
+
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OWNER_PHONE = os.getenv("OWNER_PHONE")  # maslan 923001234567 (+ ke baghair)
+OWNER_PHONE = normalize_phone(os.getenv("OWNER_PHONE"))  # maslan 923001234567
 
-# Instagram aur Messenger ke liye PAGE ka access token (WhatsApp wala nahi)
+# Instagram aur Messenger dono ke liye Facebook PAGE ka access token (WhatsApp wala nahi)
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", WHATSAPP_TOKEN)
-# Sirf tab set karein jab Instagram "Instagram Login" wale tareeqe se juda ho
-INSTAGRAM_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN")
+
 # Debugging: poora webhook payload log karta hai. Sab theek hone par Railway mein 0 kar dein.
 DEBUG_WEBHOOK = os.getenv("DEBUG_WEBHOOK", "1") == "1"
 
@@ -53,6 +64,18 @@ if not os.getenv("PAGE_ACCESS_TOKEN"):
     logging.warning(
         "PAGE_ACCESS_TOKEN set nahi hai: Instagram/Messenger replies fail hongi."
     )
+logging.info(
+    f"Owner notifications: {'ON (' + OWNER_PHONE[:4] + '***)' if OWNER_PHONE else 'OFF (OWNER_PHONE set nahi)'}"
+)
+
+# WhatsApp error codes ke hal (logs mein dikhane ke liye)
+WA_ERROR_HINTS = {
+    131047: "-> 24 ghante ka qaida: us number se pehle bot ko WhatsApp par koi message bhejwayein.",
+    131030: "-> number test recipient list mein add/verify nahi (Meta > WhatsApp > API Setup).",
+    131026: "-> message deliver nahi ho saka (number WhatsApp par nahi ya block).",
+    190: "-> WHATSAPP_TOKEN galat ya expire.",
+    100: "-> number ya parameter ka format galat.",
+}
 
 # ---------- Brands aur Items ----------
 CURRENCY = "Rs"
@@ -508,14 +531,24 @@ def finalize_order(phone, session, platform="whatsapp"):
         f"Hum jald aap se rabta karenge.",
     )
 
-    if OWNER_PHONE and str(OWNER_PHONE) != str(phone):
-        send_whatsapp_message(
+    # ---- Owner ko notification ----
+    if not OWNER_PHONE:
+        logging.warning(
+            f"Order {order_id}: OWNER_PHONE set nahi hai, owner notification skip.")
+    elif str(OWNER_PHONE) == str(phone):
+        logging.info(
+            f"Order {order_id}: customer aur owner ka number same hai, owner notification skip.")
+    else:
+        ok, _ = send_whatsapp_message(
             OWNER_PHONE,
             f"🆕 Naya order {order_id} ({platform.upper()})\n"
             f"Customer: {session['name']} ({phone})\n"
             f"{pname} x {qty} = {CURRENCY} {total}\n"
             f"Pata: {session['address']}",
         )
+        logging.info(
+            f"Order {order_id}: owner notification "
+            f"{'Meta ne qabool ki' if ok else 'FAIL hui'} ({OWNER_PHONE[:4]}***)")
 
 
 # ---------- Instagram / Messenger text handler ----------
@@ -575,6 +608,17 @@ async def receive_webhook(request: Request):
             for entry in body.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
+
+                    # Delivery status: nakam messages hamesha log karein
+                    for st in value.get("statuses", []):
+                        if st.get("status") == "failed":
+                            errs = st.get("errors") or []
+                            code = errs[0].get("code") if errs else None
+                            logging.error(
+                                f"WhatsApp DELIVERY FAILED to {st.get('recipient_id')}: "
+                                f"code={code} {json.dumps(errs)[:300]} "
+                                f"{WA_ERROR_HINTS.get(code, '')}")
+
                     if "messages" not in value:
                         continue
 
@@ -709,6 +753,7 @@ def get_reply(command, platform="whatsapp"):
 
 # ---------- Sending Functions (WhatsApp, Instagram, Messenger) ----------
 def send_payload(payload):
+    """WhatsApp ko payload bhejta hai. (ok, data) wapas deta hai."""
     try:
         url = f"https://graph.facebook.com/v20.0/{PHONE_NUMBER_ID}/messages"
         headers = {
@@ -716,15 +761,29 @@ def send_payload(payload):
             "Content-Type": "application/json",
         }
         r = requests.post(url, json=payload, headers=headers, timeout=30)
-        if r.status_code != 200:
-            logging.error(f"WhatsApp send error {r.status_code}: {r.text}")
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw": r.text[:300]}
+
+        if r.status_code == 200:
+            logging.info(f"WhatsApp send OK to {str(payload.get('to'))[:4]}***")
+            return True, data
+
+        err = data.get("error", {}) if isinstance(data, dict) else {}
+        code = err.get("code")
+        logging.error(
+            f"WhatsApp send error {r.status_code} (code {code}) to "
+            f"{str(payload.get('to'))[:4]}***: {r.text[:400]} {WA_ERROR_HINTS.get(code, '')}")
+        return False, data
     except Exception as e:
         logging.error(f"Error sending WhatsApp payload: {e}")
+        return False, {}
 
 
 def send_whatsapp_message(recipient_phone, message_text):
     save_message(recipient_phone, "out", message_text)
-    send_payload({
+    return send_payload({
         "messaging_product": "whatsapp",
         "to": recipient_phone,
         "type": "text",
@@ -733,18 +792,13 @@ def send_whatsapp_message(recipient_phone, message_text):
 
 
 def _send_social(platform, recipient_id, message_text):
+    """Instagram aur Messenger dono Facebook Page ke token se jate hain."""
     save_message(recipient_id, "out", message_text)
 
-    if platform == "instagram" and INSTAGRAM_TOKEN:
-        url = "https://graph.instagram.com/v20.0/me/messages"
-        token = INSTAGRAM_TOKEN
-    else:
-        url = "https://graph.facebook.com/v20.0/me/messages"
-        token = PAGE_ACCESS_TOKEN
+    url = "https://graph.facebook.com/v20.0/me/messages"
     limit = 900 if platform == "instagram" else 1900  # IG: 1000 bytes, Messenger: 2000 chars
-
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {PAGE_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
     for part in split_text(message_text, limit):
