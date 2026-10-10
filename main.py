@@ -78,8 +78,11 @@ WA_ERROR_HINTS = {
 }
 
 # ---------- Brands aur Items ----------
+# Google Sheet mein "Products" tab ho toh catalog wahin se aata hai
+# (columns: Brand | Item | Price | Description | Active).
+# Tab na ho ya masla ho toh neeche DEFAULT_BRANDS (test products) chalte hain.
 CURRENCY = "Rs"
-BRANDS = {
+DEFAULT_BRANDS = {
     "gul_ahmed": {
         "title": "Gul Ahmed",
         "desc": "Lawn collection",
@@ -99,36 +102,133 @@ BRANDS = {
         },
     },
 }
+CATALOG_CACHE_SECONDS = 60
+SESSION_TIMEOUT_MIN = 30
 
-# Flat list (order flow isi se kaam karta hai)
+BRANDS = {}
 PRODUCTS = {}
-for _bid, _b in BRANDS.items():
-    for _pid, _it in _b["items"].items():
-        PRODUCTS[_pid] = {**_it, "brand": _b["title"], "brand_id": _bid}
-
-PRODUCT_ORDER = list(PRODUCTS.keys())  # numbered catalog isi tarteeb mein
+PRODUCT_ORDER = []  # numbered catalog isi tarteeb mein
+CATALOG_TEXT = ""
+_catalog_state = {"loaded_at": 0.0, "source": None, "count": -1}
 
 
 def product_name(p):
     return f"{p['brand']} - {p['title']}"
 
 
-CATALOG_TEXT = " | ".join(
-    f"{b['title']}: " + ", ".join(
-        f"{i['title']} ({CURRENCY} {i['price']})" for i in b["items"].values()
+def _apply_catalog(brands, source):
+    """Naye objects banata hai aur ek saath lagata hai (chalta hua code mehfooz rehta hai)."""
+    global BRANDS, PRODUCTS, PRODUCT_ORDER, CATALOG_TEXT
+    products = {}
+    for bid, b in brands.items():
+        for pid, it in b["items"].items():
+            products[pid] = {**it, "brand": b["title"], "brand_id": bid}
+    catalog_text = " | ".join(
+        f"{b['title']}: " + ", ".join(
+            f"{i['title']} ({CURRENCY} {i['price']})" for i in b["items"].values()
+        )
+        for b in brands.values()
     )
-    for b in BRANDS.values()
-)
-SESSION_TIMEOUT_MIN = 30
+    PRODUCTS = products
+    PRODUCT_ORDER = list(products.keys())
+    CATALOG_TEXT = catalog_text
+    BRANDS = brands
 
-SYSTEM_PROMPT = (
-    "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional omnichannel assistant ho. "
-    "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
-    "Jawab chhota rakho (2-4 jumle), saada text mein, heading ya markdown ke baghair. "
-    f"Hamare brands aur products: {CATALOG_TEXT}. Sirf inhi products aur qeematein ki baat karo, koi aur qeemat na banao. "
-    "Agar user aam sawal puche toh uska seedha aur acha jawab do. "
-    "Lekin bar bar ya har message ke aakhir mein 'catalog likhein' likhne ki zaroorat nahi hai, sirf tab kaho jab user shopping ya order ki baat kare."
-)
+    if _catalog_state["source"] != source or _catalog_state["count"] != len(products):
+        logging.info(
+            f"Catalog {source} se load hua: {len(brands)} brands, {len(products)} items")
+        if len(brands) > 10 or any(len(b["items"]) > 10 for b in brands.values()):
+            logging.warning("WhatsApp list mein sirf pehle 10 brands/items dikhte hain.")
+    _catalog_state["source"] = source
+    _catalog_state["count"] = len(products)
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "_", str(text).lower()).strip("_") or "x"
+
+
+def _parse_price(v):
+    s = re.sub(r"[^\d.]", "", str(v))
+    if not s:
+        return None
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return int(f) if f == int(f) else f
+
+
+def _load_catalog_from_sheet():
+    """'Products' tab padhta hai. Tab na ho toh None."""
+    if not sheet:
+        return None
+    try:
+        ws = sheet.spreadsheet.worksheet("Products")
+    except Exception:
+        return None  # Products tab nahi hai
+
+    values = ws.get_all_values()
+    if len(values) < 2:
+        return None
+    headers = [str(h).strip().lower() for h in values[0]]
+
+    brands, seen = {}, set()
+    for i, r in enumerate(values[1:], start=2):
+        row = {headers[j]: r[j] for j in range(min(len(headers), len(r))) if headers[j]}
+        brand = str(row.get("brand", "")).strip()
+        item = str(row.get("item") or row.get("items") or "").strip()
+        if not brand and not item:
+            continue
+        if str(row.get("active", "yes")).strip().lower() in (
+                "no", "n", "false", "0", "off", "inactive"):
+            continue
+        price = _parse_price(row.get("price"))
+        if not brand or not item or price is None:
+            logging.warning(f"Products sheet ki row {i} skip (brand/item/price adhoora)")
+            continue
+        bid = _slug(brand)
+        pid = f"{bid}__{_slug(item)}"[:60]
+        base, n = pid, 2
+        while pid in seen:
+            pid = f"{base}_{n}"
+            n += 1
+        seen.add(pid)
+        b = brands.setdefault(bid, {"title": brand, "desc": "", "items": {}})
+        b["items"][pid] = {
+            "title": item,
+            "price": price,
+            "desc": str(row.get("description") or row.get("desc") or "").strip() or "-",
+        }
+    return brands or None
+
+
+def refresh_catalog(force=False):
+    now = datetime.now(timezone.utc).timestamp()
+    if not force and now - _catalog_state["loaded_at"] < CATALOG_CACHE_SECONDS:
+        return
+    _catalog_state["loaded_at"] = now
+    try:
+        brands = _load_catalog_from_sheet()
+    except Exception as e:
+        logging.error(f"Products sheet padhne mein masla (pichla catalog chalta rahega): {e}")
+        return
+    if brands:
+        _apply_catalog(brands, "sheet")
+
+
+def system_prompt():
+    return (
+        "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional omnichannel assistant ho. "
+        "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
+        "Jawab chhota rakho (2-4 jumle), saada text mein, heading ya markdown ke baghair. "
+        f"Hamare brands aur products: {CATALOG_TEXT}. Sirf inhi products aur qeematein ki baat karo, koi aur qeemat na banao. "
+        "Agar user aam sawal puche toh uska seedha aur acha jawab do. "
+        "Lekin bar bar ya har message ke aakhir mein 'catalog likhein' likhne ki zaroorat nahi hai, sirf tab kaho jab user shopping ya order ki baat kare."
+    )
+
+
+_apply_catalog(DEFAULT_BRANDS, "default")
+
 FIXED_COMMANDS = ["help", "status", "about"]
 GREETINGS = ["hi", "hello", "salam", "menu"]
 CATALOG_WORDS = ["order", "kharidna", "catalog", "products", "shop"]
@@ -161,6 +261,9 @@ try:
         logging.info("Google Sheets connected successfully!")
 except Exception as e:
     logging.error(f"Google Sheets connection error: {e}")
+
+# Server start hote hi catalog sheet se load karein
+refresh_catalog(force=True)
 
 
 def log_order_to_sheet(row):
@@ -422,7 +525,7 @@ def ask_ai(phone, media_id=None, caption=""):
 
     contents = merge_turns(contents)
 
-    text, err = generate(contents, SYSTEM_PROMPT, 1000)
+    text, err = generate(contents, system_prompt(), 1000)
     if err:
         logging.error(f"AI error: {err}")
         return "Maazrat, abhi AI jawab nahi de saka. Thori der baad try karein."
@@ -600,6 +703,7 @@ async def receive_webhook(request: Request):
     try:
         body = await request.json()
         object_type = body.get("object")
+        await asyncio.to_thread(refresh_catalog)  # Sheet se taaza catalog (har 60 second mein)
         if DEBUG_WEBHOOK:
             logging.info(f"WEBHOOK object={object_type}: {json.dumps(body)[:1500]}")
 
