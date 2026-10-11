@@ -25,6 +25,8 @@ from gemini_client import generate
 
 load_dotenv()
 
+APP_VERSION = "settings-v2"
+
 # ---------- Logging Setup (Console + File) ----------
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +38,13 @@ logging.basicConfig(
 )
 
 app = FastAPI()
+logging.info(f"main.py version: {APP_VERSION}")
+
+
+@app.get("/")
+async def home():
+    """Browser mein Railway ka link kholne par pata chalta hai ke kaunsa code live hai."""
+    return {"status": "ok", "version": APP_VERSION}
 
 
 def normalize_phone(raw):
@@ -52,7 +61,10 @@ WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-OWNER_PHONE = normalize_phone(os.getenv("OWNER_PHONE"))  # maslan 923001234567
+OWNER_PHONE = normalize_phone(os.getenv("OWNER_PHONE"))  # Settings tab mein owner_phone ho toh woh upar chalta hai
+
+# Har client ki apni Sheet: Railway mein SHEET_NAME set karein (default "Apex Orders")
+SHEET_NAME = os.getenv("SHEET_NAME", "Apex Orders")
 
 # Instagram aur Messenger dono ke liye Facebook PAGE ka access token (WhatsApp wala nahi)
 PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN", WHATSAPP_TOKEN)
@@ -64,9 +76,6 @@ if not os.getenv("PAGE_ACCESS_TOKEN"):
     logging.warning(
         "PAGE_ACCESS_TOKEN set nahi hai: Instagram/Messenger replies fail hongi."
     )
-logging.info(
-    f"Owner notifications: {'ON (' + OWNER_PHONE[:4] + '***)' if OWNER_PHONE else 'OFF (OWNER_PHONE set nahi)'}"
-)
 
 # WhatsApp error codes ke hal (logs mein dikhane ke liye)
 WA_ERROR_HINTS = {
@@ -76,6 +85,21 @@ WA_ERROR_HINTS = {
     190: "-> WHATSAPP_TOKEN galat ya expire.",
     100: "-> number ya parameter ka format galat.",
 }
+
+# ---------- Settings (Google Sheet ke "Settings" tab se) ----------
+# "Settings" tab: Key | Value. Khali value ho toh neeche ka default chalta hai.
+DEFAULT_SETTINGS = {
+    "business_name": "Apex Order Bot",
+    "greeting": "Assalam-o-Alaikum! Main {business} hoon. Main aapki kya madad kar sakta hoon?",
+    "about": "Main {business} ka WhatsApp assistant hoon, AI ke saath 🤖",
+    "extra_info": "",
+    "currency": "Rs",
+    "owner_phone": "",
+    "thank_you": "Hum jald aap se rabta karenge.",
+}
+SETTINGS_CACHE_SECONDS = 60
+SETTINGS = dict(DEFAULT_SETTINGS)
+_settings_state = {"loaded_at": 0.0}
 
 # ---------- Brands aur Items ----------
 # Google Sheet mein "Products" tab ho toh catalog wahin se aata hai
@@ -216,14 +240,92 @@ def refresh_catalog(force=False):
         _apply_catalog(brands, "sheet")
 
 
+# ---------- Settings ke helper ----------
+def biz():
+    return SETTINGS["business_name"]
+
+
+def fmt(text):
+    return str(text).replace("{business}", biz())
+
+
+def greeting_text():
+    return fmt(SETTINGS["greeting"])
+
+
+def owner_phone():
+    return normalize_phone(SETTINGS.get("owner_phone")) or OWNER_PHONE
+
+
+def _load_settings_from_sheet():
+    """'Settings' tab (Key | Value) padhta hai. Tab na ho toh None. Wajah logs mein likhta hai."""
+    if not sheet:
+        logging.warning("Settings: Google Sheet connected nahi.")
+        return None
+    try:
+        ws = sheet.spreadsheet.worksheet("Settings")
+    except Exception:
+        titles = [w.title for w in sheet.spreadsheet.worksheets()]
+        logging.warning(f"'Settings' tab nahi mila. Maujooda tabs: {titles}")
+        return None
+    data = {}
+    for r in ws.get_all_values():
+        if len(r) < 2:
+            continue
+        key = re.sub(r"[^a-z0-9]+", "_", str(r[0]).lower()).strip("_")
+        val = str(r[1]).strip()
+        if not key or key == "key":
+            continue
+        if key not in DEFAULT_SETTINGS:
+            logging.warning(
+                f"Settings: key '{r[0]}' pehchani nahi gayi (sahi naam: {list(DEFAULT_SETTINGS)})")
+            continue
+        if val:
+            data[key] = val
+    logging.info(f"Settings tab se yeh keys mili: {list(data)}")
+    return data
+
+
+def refresh_settings(force=False):
+    global SETTINGS, CURRENCY
+    now = datetime.now(timezone.utc).timestamp()
+    if not force and now - _settings_state["loaded_at"] < SETTINGS_CACHE_SECONDS:
+        return
+    _settings_state["loaded_at"] = now
+    try:
+        data = _load_settings_from_sheet()
+    except Exception as e:
+        logging.error(f"Settings sheet padhne mein masla (pichli settings chalti rahengi): {e}")
+        return
+    if data is None:
+        return
+    new = dict(DEFAULT_SETTINGS)
+    new.update(data)
+    if new == SETTINGS:
+        return
+    SETTINGS = new
+    CURRENCY = new["currency"]
+    logging.info(f"Settings sheet se update hui: business='{new['business_name']}', currency='{CURRENCY}'")
+    if BRANDS:  # currency badli ho toh catalog text dobara banay
+        _apply_catalog(BRANDS, _catalog_state["source"])
+
+
+def refresh_all(force=False):
+    refresh_settings(force)
+    refresh_catalog(force)
+
+
 def system_prompt():
+    extra = SETTINGS.get("extra_info", "").strip()
     return (
-        "Tum 'Apex Order Bot' ho, jo e-commerce aur orders manage karne wala professional omnichannel assistant ho. "
+        f"Tum '{biz()}' ho, jo orders manage karne wala professional omnichannel assistant ho. "
         "User jis zubaan mein likhe (Roman Urdu, Urdu ya English), usi mein jawab do. "
         "Jawab chhota rakho (2-4 jumle), saada text mein, heading ya markdown ke baghair. "
         f"Hamare brands aur products: {CATALOG_TEXT}. Sirf inhi products aur qeematein ki baat karo, koi aur qeemat na banao. "
-        "Agar user aam sawal puche toh uska seedha aur acha jawab do. "
-        "Lekin bar bar ya har message ke aakhir mein 'catalog likhein' likhne ki zaroorat nahi hai, sirf tab kaho jab user shopping ya order ki baat kare."
+        + (f"Dukaan ki maloomat (sirf inhi par bharosa karo, baqi ke baare mein andaaza na lagao): {extra}. " if extra else "")
+        + "Agar user aam sawal puche toh uska seedha aur acha jawab do. "
+        "Lekin bar bar ya har message ke aakhir mein 'catalog likhein' likhne ki zaroorat nahi hai, "
+        "sirf tab kaho jab user shopping ya order ki baat kare."
     )
 
 
@@ -243,9 +345,8 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive"
 ]
 CREDS_FILE = "credentials.json"
-SHEET_NAME = "Apex Orders"
 
-sheet = None
+sheet = None  # Orders wala tab (naam "Orders" ho toh wohi, warna pehla tab)
 try:
     creds = None
     google_creds_env = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -257,13 +358,20 @@ try:
 
     if creds:
         client = gspread.authorize(creds)
-        sheet = client.open(SHEET_NAME).sheet1
-        logging.info("Google Sheets connected successfully!")
+        spreadsheet = client.open(SHEET_NAME)
+        try:
+            sheet = spreadsheet.worksheet("Orders")
+        except Exception:
+            sheet = spreadsheet.sheet1
+        logging.info(f"Google Sheets connected: '{SHEET_NAME}' (orders tab: '{sheet.title}')")
 except Exception as e:
     logging.error(f"Google Sheets connection error: {e}")
 
-# Server start hote hi catalog sheet se load karein
-refresh_catalog(force=True)
+# Server start hote hi settings aur catalog sheet se load karein
+refresh_all(force=True)
+logging.info(
+    f"Owner notifications: {'ON (' + owner_phone()[:4] + '***)' if owner_phone() else 'OFF (OWNER_PHONE set nahi)'}"
+)
 
 
 def log_order_to_sheet(row):
@@ -631,19 +739,20 @@ def finalize_order(phone, session, platform="whatsapp"):
         f"Shukriya! Aapka order confirm ho gaya hai ✅\n"
         f"Order ID: {order_id}\n"
         f"{pname} x {qty} = {CURRENCY} {total}\n"
-        f"Hum jald aap se rabta karenge.",
+        f"{fmt(SETTINGS['thank_you'])}",
     )
 
     # ---- Owner ko notification ----
-    if not OWNER_PHONE:
+    owner = owner_phone()
+    if not owner:
         logging.warning(
-            f"Order {order_id}: OWNER_PHONE set nahi hai, owner notification skip.")
-    elif str(OWNER_PHONE) == str(phone):
+            f"Order {order_id}: owner_phone set nahi hai, owner notification skip.")
+    elif str(owner) == str(phone):
         logging.info(
             f"Order {order_id}: customer aur owner ka number same hai, owner notification skip.")
     else:
         ok, _ = send_whatsapp_message(
-            OWNER_PHONE,
+            owner,
             f"🆕 Naya order {order_id} ({platform.upper()})\n"
             f"Customer: {session['name']} ({phone})\n"
             f"{pname} x {qty} = {CURRENCY} {total}\n"
@@ -651,7 +760,7 @@ def finalize_order(phone, session, platform="whatsapp"):
         )
         logging.info(
             f"Order {order_id}: owner notification "
-            f"{'Meta ne qabool ki' if ok else 'FAIL hui'} ({OWNER_PHONE[:4]}***)")
+            f"{'Meta ne qabool ki' if ok else 'FAIL hui'} ({owner[:4]}***)")
 
 
 # ---------- Instagram / Messenger text handler ----------
@@ -668,7 +777,7 @@ async def handle_social_text(sender_id, text, platform):
         clear_session(sender_id)
         send_reply_to_user(
             sender_id, platform,
-            "Assalam-o-Alaikum! 👋 Main Apex Order Bot hoon.\n"
+            f"{greeting_text()}\n"
             "Products dekhne ke liye 'catalog' likhein, madad ke liye 'help' likhein, "
             "ya koi bhi sawal pooch lein.")
     elif session:
@@ -703,7 +812,7 @@ async def receive_webhook(request: Request):
     try:
         body = await request.json()
         object_type = body.get("object")
-        await asyncio.to_thread(refresh_catalog)  # Sheet se taaza catalog (har 60 second mein)
+        await asyncio.to_thread(refresh_all)  # Sheet se taaza settings/catalog (har 60 second mein)
         if DEBUG_WEBHOOK:
             logging.info(f"WEBHOOK object={object_type}: {json.dumps(body)[:1500]}")
 
@@ -851,7 +960,7 @@ def get_reply(command, platform="whatsapp"):
     if command == "status":
         return "Bot bilkul theek aur active halat mein kaam kar raha hai!"
     if command == "about":
-        return "Main FastAPI par bana ek omnichannel bot hoon, AI ke saath 🤖"
+        return fmt(SETTINGS["about"])
     return "Samajh nahi aaya. 'help' likhein."
 
 
@@ -935,7 +1044,7 @@ def send_buttons(recipient_phone):
         "type": "interactive",
         "interactive": {
             "type": "button",
-            "body": {"text": "Assalam-o-Alaikum! Main aapki kya madad kar sakta hoon? 👇"},
+            "body": {"text": f"{greeting_text()} 👇"[:1000]},
             "action": {
                 "buttons": [
                     {"type": "reply", "reply": {"id": "status", "title": "Status"}},
@@ -992,7 +1101,7 @@ def send_brand_list(recipient_phone):
                 "type": "list",
                 "header": {"type": "text", "text": "🛍️ Hamare Brands"},
                 "body": {"text": "Pehle brand chunein, phir uski items dekhein:"},
-                "footer": {"text": "Powered by Apex Order Bot"},
+                "footer": {"text": f"Powered by {biz()}"[:60]},
                 "action": {
                     "button": "Brands Dekhein",
                     "sections": [{"title": "Brands", "rows": rows}],
