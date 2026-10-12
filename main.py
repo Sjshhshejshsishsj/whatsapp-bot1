@@ -25,7 +25,7 @@ from gemini_client import generate
 
 load_dotenv()
 
-APP_VERSION = "settings-v2"
+APP_VERSION = "settings-v3-storage"
 
 # ---------- Logging Setup (Console + File) ----------
 logging.basicConfig(
@@ -44,7 +44,11 @@ logging.info(f"main.py version: {APP_VERSION}")
 @app.get("/")
 async def home():
     """Browser mein Railway ka link kholne par pata chalta hai ke kaunsa code live hai."""
-    return {"status": "ok", "version": APP_VERSION}
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "persistent_storage": PERSISTENT_STORAGE,
+    }
 
 
 def normalize_phone(raw):
@@ -337,7 +341,13 @@ CATALOG_WORDS = ["order", "kharidna", "catalog", "products", "shop"]
 CONFIRM_WORDS = {"confirm", "yes", "haan", "han", "ha", "ok", "okay"}
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.db")
+# Database ka raasta: Railway par volume juda ho toh uska raasta (RAILWAY_VOLUME_MOUNT_PATH),
+# warna purana raasta. Volume mein data redeploy par bhi mehfooz rehta hai.
+DB_DIR = os.getenv("DB_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or os.path.dirname(os.path.abspath(__file__))
+PERSISTENT_STORAGE = bool(os.getenv("DB_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
+os.makedirs(DB_DIR, exist_ok=True)
+DB_PATH = os.path.join(DB_DIR, "bot.db")
+logging.info(f"Database path: {DB_PATH} (persistent={PERSISTENT_STORAGE})")
 
 # ---------- Google Sheets Setup ----------
 SCOPES = [
