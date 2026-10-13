@@ -25,7 +25,7 @@ from gemini_client import generate
 
 load_dotenv()
 
-APP_VERSION = "settings-v3-storage"
+APP_VERSION = "settings-v4-template"
 
 # ---------- Logging Setup (Console + File) ----------
 logging.basicConfig(
@@ -48,6 +48,7 @@ async def home():
         "status": "ok",
         "version": APP_VERSION,
         "persistent_storage": PERSISTENT_STORAGE,
+        "owner_template": bool(OWNER_TEMPLATE_NAME),
     }
 
 
@@ -66,6 +67,10 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_PHONE = normalize_phone(os.getenv("OWNER_PHONE"))  # Settings tab mein owner_phone ho toh woh upar chalta hai
+
+# Owner notification ke liye approved WhatsApp template (khali ho toh pehle jaisa text message jata hai)
+OWNER_TEMPLATE_NAME = os.getenv("OWNER_TEMPLATE_NAME", "").strip()
+OWNER_TEMPLATE_LANG = os.getenv("OWNER_TEMPLATE_LANG", "en_US").strip()
 
 # Har client ki apni Sheet: Railway mein SHEET_NAME set karein (default "Apex Orders")
 SHEET_NAME = os.getenv("SHEET_NAME", "Apex Orders")
@@ -86,6 +91,8 @@ WA_ERROR_HINTS = {
     131047: "-> 24 ghante ka qaida: us number se pehle bot ko WhatsApp par koi message bhejwayein.",
     131030: "-> number test recipient list mein add/verify nahi (Meta > WhatsApp > API Setup).",
     131026: "-> message deliver nahi ho saka (number WhatsApp par nahi ya block).",
+    132000: "-> template ke variables ki ginti galat (template mein 6 hone chahiye).",
+    132001: "-> template ka naam ya language galat, ya template abhi approve nahi.",
     190: "-> WHATSAPP_TOKEN galat ya expire.",
     100: "-> number ya parameter ka format galat.",
 }
@@ -381,6 +388,7 @@ except Exception as e:
 refresh_all(force=True)
 logging.info(
     f"Owner notifications: {'ON (' + owner_phone()[:4] + '***)' if owner_phone() else 'OFF (OWNER_PHONE set nahi)'}"
+    f", template: {OWNER_TEMPLATE_NAME or 'nahi (text message)'}"
 )
 
 
@@ -761,15 +769,17 @@ def finalize_order(phone, session, platform="whatsapp"):
         logging.info(
             f"Order {order_id}: customer aur owner ka number same hai, owner notification skip.")
     else:
-        ok, _ = send_whatsapp_message(
+        ok, mode = send_owner_alert(
             owner,
             f"🆕 Naya order {order_id} ({platform.upper()})\n"
             f"Customer: {session['name']} ({phone})\n"
             f"{pname} x {qty} = {CURRENCY} {total}\n"
             f"Pata: {session['address']}",
+            [order_id, platform.upper(), f"{session['name']} ({phone})",
+             f"{pname} x {qty}", f"{CURRENCY} {total}", session["address"]],
         )
         logging.info(
-            f"Order {order_id}: owner notification "
+            f"Order {order_id}: owner notification ({mode}) "
             f"{'Meta ne qabool ki' if ok else 'FAIL hui'} ({owner[:4]}***)")
 
 
@@ -1012,6 +1022,36 @@ def send_whatsapp_message(recipient_phone, message_text):
         "type": "text",
         "text": {"body": message_text},
     })
+
+
+def _clean_param(value, limit=200):
+    """Template variable mein nayi line/tab/zyada space nahi ho sakte."""
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return (text or "-")[:limit]
+
+
+def send_owner_alert(owner, text_message, params):
+    """Pehle approved template try karta hai, na ho/fail ho toh simple text bhejta hai."""
+    if OWNER_TEMPLATE_NAME:
+        ok, _ = send_payload({
+            "messaging_product": "whatsapp",
+            "to": owner,
+            "type": "template",
+            "template": {
+                "name": OWNER_TEMPLATE_NAME,
+                "language": {"code": OWNER_TEMPLATE_LANG},
+                "components": [{
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": _clean_param(p)} for p in params],
+                }],
+            },
+        })
+        if ok:
+            save_message(owner, "out", "[owner template alert]")
+            return True, "template"
+        logging.warning("Owner template fail hua, simple text bhej raha hoon.")
+    ok, _ = send_whatsapp_message(owner, text_message)
+    return ok, "text"
 
 
 def _send_social(platform, recipient_id, message_text):
