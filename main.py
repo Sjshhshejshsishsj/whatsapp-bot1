@@ -38,6 +38,8 @@ logging.basicConfig(
 )
 
 app = FastAPI()
+from legal_pages import router as legal_router
+app.include_router(legal_router)
 logging.info(f"main.py version: {APP_VERSION}")
 
 
