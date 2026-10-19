@@ -25,7 +25,7 @@ from gemini_client import generate
 
 load_dotenv()
 
-APP_VERSION = "settings-v4-template"
+APP_VERSION = "settings-v5-intent"
 
 # ---------- Logging Setup (Console + File) ----------
 logging.basicConfig(
@@ -38,9 +38,14 @@ logging.basicConfig(
 )
 
 app = FastAPI()
-from legal_pages import router as legal_router
-app.include_router(legal_router)
 logging.info(f"main.py version: {APP_VERSION}")
+
+# Privacy Policy / Terms / Data Deletion pages (legal_pages.py file honi chahiye)
+try:
+    from legal_pages import router as legal_router
+    app.include_router(legal_router)
+except Exception as e:
+    logging.warning(f"legal_pages load nahi hui (/privacy, /terms, /data-deletion nahi chalenge): {e}")
 
 
 @app.get("/")
@@ -338,7 +343,9 @@ def system_prompt():
         + (f"Dukaan ki maloomat (sirf inhi par bharosa karo, baqi ke baare mein andaaza na lagao): {extra}. " if extra else "")
         + "Agar user aam sawal puche toh uska seedha aur acha jawab do. "
         "Lekin bar bar ya har message ke aakhir mein 'catalog likhein' likhne ki zaroorat nahi hai, "
-        "sirf tab kaho jab user shopping ya order ki baat kare."
+        "sirf tab kaho jab user shopping ya order ki baat kare. "
+        "Order ki halat (kahan pohoncha), cancel ya tabdeeli ka faisla tum nahi kar sakte aur koi wada ya tasdeeq nahi dena: "
+        "customer ko kaho ke wo apna Order ID bhej dein aur business jald rabta karega."
     )
 
 
@@ -346,9 +353,39 @@ _apply_catalog(DEFAULT_BRANDS, "default")
 
 FIXED_COMMANDS = ["help", "status", "about"]
 GREETINGS = ["hi", "hello", "salam", "menu"]
-CATALOG_WORDS = ["order", "kharidna", "catalog", "products", "shop"]
 CONFIRM_WORDS = {"confirm", "yes", "haan", "han", "ha", "ok", "okay"}
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# ---------- Intent (poore lafz dekhta hai, tukde nahi) ----------
+CATALOG_WORDS = {
+    "order", "kharidna", "khareedna", "catalog", "products", "product", "shop",
+    "items", "price", "rate", "qeemat",
+}
+CANCEL_WORDS = {"cancel", "cancelled", "canceled", "radd"}
+# Yeh lafz hon toh jumla sawal/shikayat hai, catalog nahi dikhana, AI jawab dega
+NON_CATALOG_WORDS = {
+    "kab", "kahan", "kahaan", "status", "track", "tracking", "delivery", "deliver",
+    "aya", "aaya", "ayega", "aayega", "pohncha", "pohoncha", "late", "kitna", "kitne",
+    "kyun", "kyon", "payment", "return", "exchange", "refund", "change", "badal",
+    "badalna", "complaint", "shikayat", "galat",
+}
+
+
+def detect_intent(command, in_session=False):
+    """'cancel', 'catalog' ya None. Cancel hamesha pehle dekha jata hai.
+    Catalog sirf chhote seedhe jumlon par, lambay sawal AI ke paas jate hain."""
+    tokens = re.findall(r"[a-z0-9_']+", str(command).lower())
+    if not tokens:
+        return None
+    if any(t in CANCEL_WORDS for t in tokens):
+        # Order ke darmiyan lamba text (maslan pata) cancel na samjha jaye
+        if not (in_session and len(tokens) > 6):
+            return "cancel"
+    if len(tokens) <= 5 and any(t in CATALOG_WORDS for t in tokens):
+        if not any(t in NON_CATALOG_WORDS for t in tokens):
+            return "catalog"
+    return None
+
 
 # Database ka raasta: Railway par volume juda ho toh uska raasta (RAILWAY_VOLUME_MOUNT_PATH),
 # warna purana raasta. Volume mein data redeploy par bhi mehfooz rehta hai.
@@ -785,16 +822,35 @@ def finalize_order(phone, session, platform="whatsapp"):
             f"{'Meta ne qabool ki' if ok else 'FAIL hui'} ({owner[:4]}***)")
 
 
+def handle_cancel_request(phone, platform, raw_text):
+    """Confirm ho chuka order bot khud cancel nahi kar sakta: business ko khabar deta hai."""
+    send_reply_to_user(
+        phone, platform,
+        "Aap ki cancel ki request business tak pohoncha di gayi hai. "
+        "Agar Order ID yaad ho toh yahan bhej dein, taake jaldi cancel ho sake.")
+    owner = owner_phone()
+    if owner and str(owner) != str(phone):
+        ok, _ = send_whatsapp_message(
+            owner,
+            f"⚠️ Cancel request ({platform.upper()})\n"
+            f"Customer: {phone}\n"
+            f"Message: {_clean_param(raw_text, 300)}")
+        logging.info(f"Cancel request owner ko {'bhej di' if ok else 'NAHI bheji ja saki'}")
+
+
 # ---------- Instagram / Messenger text handler ----------
 async def handle_social_text(sender_id, text, platform):
     command = text.lower().strip()
     session = get_session(sender_id)
 
-    if command in ["cancel", "order_cancel"]:
-        clear_session(sender_id)
-        send_reply_to_user(
-            sender_id, platform,
-            "Order cancel kar diya gaya. Catalog dekhne ke liye 'catalog' likhein.")
+    if detect_intent(command, bool(session)) == "cancel":
+        if session:
+            clear_session(sender_id)
+            send_reply_to_user(
+                sender_id, platform,
+                "Aap ka adhoora order cancel kar diya gaya. Catalog dekhne ke liye 'catalog' likhein.")
+        else:
+            handle_cancel_request(sender_id, platform, text)
     elif command in GREETINGS:
         clear_session(sender_id)
         send_reply_to_user(
@@ -806,7 +862,7 @@ async def handle_social_text(sender_id, text, platform):
         handle_order_step(sender_id, text, session, platform)
     elif command in FIXED_COMMANDS:
         send_reply_to_user(sender_id, platform, get_reply(command, platform))
-    elif any(word in command for word in CATALOG_WORDS):
+    elif detect_intent(command) == "catalog":
         send_reply_to_user(sender_id, platform, build_social_catalog())
     else:
         pid = find_product(text, allow_number=last_out_is_catalog(sender_id))
@@ -904,10 +960,19 @@ async def receive_webhook(request: Request):
                             send_whatsapp_message(
                                 sender_phone,
                                 "Koi active order nahi hai. Naya order shuru karne ke liye 'catalog' likhein.")
-                    elif command in ["order_cancel", "cancel"]:
+                    elif command == "order_cancel":
                         clear_session(sender_phone)
                         send_whatsapp_message(
-                            sender_phone, "Order cancel kar diya gaya. Dobara shuru karne ke liye 'catalog' likhein.")
+                            sender_phone,
+                            "Aap ka adhoora order cancel kar diya gaya. Dobara shuru karne ke liye 'catalog' likhein.")
+                    elif msg_type == "text" and detect_intent(command, bool(session)) == "cancel":
+                        if session:
+                            clear_session(sender_phone)
+                            send_whatsapp_message(
+                                sender_phone,
+                                "Aap ka adhoora order cancel kar diya gaya. Dobara shuru karne ke liye 'catalog' likhein.")
+                        else:
+                            handle_cancel_request(sender_phone, "whatsapp", raw_text)
                     elif command in GREETINGS:
                         clear_session(sender_phone)
                         send_buttons(sender_phone)
@@ -919,7 +984,7 @@ async def receive_webhook(request: Request):
                         send_item_list(sender_phone, command[6:])
                     elif command in PRODUCTS:
                         start_order(sender_phone, command, "whatsapp")
-                    elif any(word in command for word in CATALOG_WORDS):
+                    elif msg_type == "text" and detect_intent(command) == "catalog":
                         send_catalog(sender_phone)
                     else:
                         ai_text = await asyncio.to_thread(ask_ai, sender_phone)
